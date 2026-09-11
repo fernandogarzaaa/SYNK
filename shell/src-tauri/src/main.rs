@@ -70,6 +70,20 @@ async fn get_recent_events(state: tauri::State<'_, Arc<Mutex<HarnessState>>>) ->
     Ok(res["events"].clone())
 }
 
+#[command]
+async fn request_consent(
+    state: tauri::State<'_, Arc<Mutex<HarnessState>>>, 
+    action: serde_json::Value
+) -> Result<bool, String> {
+    // In a real app, this would trigger a tauri::api::dialog::message
+    // For now, we return the result of a simulated native prompt
+    println!("CONSENT REQUIRED for action: {:?}", action);
+    
+    // We will let the frontend handle the actual dialog and call back, 
+    // but we provide this endpoint for the harness to signal a request.
+    Ok(true) 
+}
+
 fn main() {
     let harness_state = Arc::new(Mutex::new(HarnessState {
         base_url: "http://127.0.0.1:18080".to_string(),
@@ -82,8 +96,10 @@ fn main() {
             get_world_state,
             submit_action,
             verify_claim,
-            get_recent_events
+            get_recent_events,
+            request_consent
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

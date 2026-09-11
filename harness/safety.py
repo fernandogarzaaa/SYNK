@@ -59,7 +59,13 @@ class AuditEntry:
     hash: str
 
 
+# Result codes
+ALLOWED = "allowed"
+DENIED = "denied"
+CONSENT_REQUIRED = "consent_required"
+
 class SafetyLayer:
+
     """Stateless validator + stateful tamper-evident audit log."""
 
     def __init__(self, config: SafetyConfig | None = None):
@@ -89,27 +95,28 @@ class SafetyLayer:
                  paused_for_user: bool = False) -> tuple[bool, str]:
         """Returns (ok, reason). Human priority: if paused_for_user, deny agent acts."""
         if paused_for_user:
-            return False, "denied: human is interacting - agent paused (human priority)"
+            return False, f"{DENIED}: human is interacting - agent paused (human priority)"
         tool = action.get("tool", action.get("action", ""))
         if tool not in self.config.allowed_tools:
-            return False, f"denied: tool '{tool}' not in allowlist"
+            return False, f"{DENIED}: tool '{tool}' not in allowlist"
         blob = f"{tool} {action.get('args', action)}"
         if self.config.consent_for_destructive and DESTRUCTIVE_PATTERNS.search(blob):
             if not user_consented:
-                return False, "denied: destructive action requires explicit user consent"
+                return False, CONSENT_REQUIRED
         if tool == "navigate":
             url = str(action.get("url", action.get("args", "")))
             if self.config.allowed_domains and not any(
                     d in url for d in self.config.allowed_domains):
-                return False, f"denied: navigation outside allowlist ({url})"
+                return False, f"{DENIED}: navigation outside allowlist ({url})"
             if not url.startswith(("http://", "https://", "about:", "chrome:")):
-                return False, f"denied: unsafe navigation scheme ({url})"
+                return False, f"{DENIED}: unsafe navigation scheme ({url})"
         # Banking view-only policy example
         if any(k in (page_url or "").lower() for k in self.config.banking_view_only):
             if tool in ("click", "type", "bulk", "upload") and DESTRUCTIVE_PATTERNS.search(blob):
                 if not user_consented:
-                    return False, "denied: banking view-only policy"
-        return True, "allowed"
+                    return False, CONSENT_REQUIRED
+        return True, ALLOWED
+
 
     def validate_bulk(self, actions: list[dict], **kw) -> tuple[list[dict], list[dict]]:
         allowed, denied = [], []

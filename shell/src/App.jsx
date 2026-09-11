@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { WorldStateView, ActionPanel, TruthLayerStatus } from './components/RuntimeUI';
 import { EventLog } from './components/EventLog';
+import { OwnershipMonitor } from './components/OwnershipMonitor';
 
 function App() {
   const [state, setState] = useState({ world: {}, ownership: {}, events: [] });
@@ -61,6 +62,8 @@ function App() {
         </header>
 
         <WorldStateView world={state.world} ownership={state.ownership} />
+        
+        <OwnershipMonitor ownership={state.ownership} />
         
         <ActionPanel onAction={handleAction} />
         
