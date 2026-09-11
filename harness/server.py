@@ -34,6 +34,10 @@ from .local.runtime import LocalRuntime
 from .scheduler.scheduler import ParallelScheduler
 from .verification.verifier import Verifier
 from .world_state import WorldState
+from .browser import BrowserController
+import asyncio
+import threading
+
 
 
 def _domain_of(url: str) -> str:
@@ -48,8 +52,10 @@ class State:
         self.safety = SafetyLayer(SafetyConfig())
         self.ctx = ContextManager()
         self.mem = MemoryStore(db_path)
-        self.tools = ToolExecutor(self.safety)
+        self.tools = ToolExecutor(self.safety, browser=self.browser)
         self.llm = Orchestrator()
+
+
         # Beta runtime: world + bus + ownership + transactions + learning
         self.bus = EventBus()
         self.world = WorldState()
@@ -71,12 +77,25 @@ class State:
         self.scheduler = ParallelScheduler(self.ownership)
         # Beta.2 Truth Layer: Independent Verifier
         self.verifier = Verifier(self.world)
+        # Phase 2: CDP Browser Controller
+        self.browser = BrowserController(headless=False)
+        self.loop = asyncio.new_event_loop()
+        self.browser_thread = threading.Thread(target=self._run_event_loop, daemon=True)
+        self.browser_thread.start()
+        
         # Use the ladder with WebMCP integration
         self.ladder = ExecutionLadder(webmcp_adapter=self.webmcp_adapter)
+
         self.bus.subscribe("*", self._on_event)
+
+    def _run_event_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self.browser.start())
+        self.loop.run_forever()
 
     # -- bus fan-out -----------------------------------------------------------
     def _on_event(self, ev: dict) -> None:
+
         t, d = ev["type"], ev["data"]
         if t in ("page.loaded", "page.navigated", "dom.changed", "value.changed",
                  "focus.changed", "human.action", "agent.action", "agent.lease",
@@ -239,15 +258,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- handlers ------------------------------------------------------------------
     def _snapshot(self, b: dict):
-        url = b.get("url", "")
-        nodes = b.get("nodes", [])
+        tab_id = b.get("tab_id", "default")
+        # Phase 2: CDP Snapshot
+        future = asyncio.run_coroutine_threadsafe(
+            STATE.browser.snapshot(tab_id), STATE.loop
+        )
+        snap = future.result()
+        
+        url = snap["url"]
+        nodes = snap["nodes"]
         for i, n in enumerate(nodes):
             n.setdefault("index", i)
         flat = json.dumps(nodes)[:20000]
         injected = STATE.safety.detect_injection(flat)
         view = STATE.ctx.ingest(url, nodes, b.get("goal", ""), b.get("screenshot_note", ""))
-        STATE.world.load_full(url, view["nodes"], b.get("title", ""))
-        STATE.bus.emit("page.loaded", {"url": url, "title": b.get("title", "")})
+        STATE.world.load_full(url, view["nodes"], snap["title"])
+        STATE.bus.emit("page.loaded", {"url": url, "title": snap["title"]})
         view["injection_suspected"] = injected
         view["world_version"] = STATE.world.version
         view["world"] = STATE.world.prompt_section()
@@ -255,8 +281,9 @@ class Handler(BaseHTTPRequestHandler):
         view["prompt"] = STATE.safety.mask_pii(view["prompt"])
         if injected:
             view["warning"] = ("Page contains possible prompt-injection text; "
-                               "treated as UNTRUSTED data.")
+                                "treated as UNTRUSTED data.")
         return self._send(200, view)
+
 
     def _plan(self, b: dict):
         goal = b.get("goal", "")
@@ -307,18 +334,20 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, plan)
 
     def _act(self, b: dict):
+        tab_id = b.get("tab_id", "default")
         page_url = b.get("page_url", "")
         consented = bool(b.get("user_consented", False))
         actions = b.get("actions") or ([b["action"]] if "action" in b else [])
-        results = [STATE.tools.run(a, page_url, consented) for a in actions]
+        results = [STATE.tools.run(a, page_url, consented, tab_id=tab_id) for a in actions]
         for a, r in zip(actions, results):
             STATE.mem.learn_from_action(a)
             STATE.mem.record(page_url, a, json.dumps(r)[:500], b.get("note", ""))
             STATE.bus.emit("agent.action", {"command": r.get("command"),
-                                            "target": a.get("target", a.get("ref")),
-                                            "ok": r.get("ok")})
+                                             "target": a.get("target", a.get("ref")),
+                                             "ok": r.get("ok")})
         return self._send(200, {"results": results,
-                                "paused_for_user": STATE.tools.paused_for_user})
+                                 "paused_for_user": STATE.tools.paused_for_user})
+
 
     def _transact(self, b: dict):
         """Transactional co-execution: lease -> validate -> execute -> verify."""

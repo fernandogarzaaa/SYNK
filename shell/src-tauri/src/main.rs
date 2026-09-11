@@ -1,0 +1,89 @@
+use serde::{Deserialize, Serialize};
+use tauri::command;
+use reqwest::Client;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HarnessState {
+    pub base_url: String,
+    pub client: Arc<Client>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct WorldSnapshot {
+    pub world: serde_json::Value,
+    pub ownership: serde_json::Value,
+    pub events: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct VerificationResult {
+    pub result: String,
+    pub reason: String,
+    pub confidence: f32,
+}
+
+#[command]
+async fn get_world_state(state: tauri::State<'_, Arc<Mutex<HarnessState>>>) -> Result<WorldSnapshot, String> {
+    let s = state.lock().await;
+    let url = format!("{}/world", s.base_url);
+    
+    let res = s.client.get(&url).send().await
+        .map_err(|e| e.to_string())?
+        .json::<serde_json::Value>().await
+        .map_err(|e| e.to_string())?;
+
+    let world = res["world"].clone();
+    let ownership = res["ownership"].clone();
+    let events = res["events"].clone();
+
+    Ok(WorldSnapshot { world, ownership, events })
+}
+
+#[command]
+async fn submit_action(
+    state: tauri::State<'_, Arc<Mutex<HarnessState>>>, 
+    action: serde_json::Value
+) -> Result<serde_json::Value, String> {
+    let s = state.lock().await;
+    let url = format!("{}/act", s.base_url);
+    
+    let res = s.client.post(&url).json(&action).send().await
+        .map_err(|e| e.to_string())?
+        .json::<serde_json::Value>().await
+        .map_err(|e| e.to_string())?;
+        
+    Ok(res)
+}
+
+#[command]
+async fn get_recent_events(state: tauri::State<'_, Arc<Mutex<HarnessState>>>) -> Result<serde_json::Value, String> {
+    let s = state.lock().await;
+    let url = format!("{}/world", s.base_url);
+    
+    let res = s.client.get(&url).send().await
+        .map_err(|e| e.to_string())?
+        .json::<serde_json::Value>().await
+        .map_err(|e| e.to_string())?;
+
+    Ok(res["events"].clone())
+}
+
+fn main() {
+    let harness_state = Arc::new(Mutex::new(HarnessState {
+        base_url: "http://127.0.0.1:18080".to_string(),
+        client: Arc::new(Client::new()),
+    }));
+
+    tauri::Builder::default()
+        .manage(harness_state)
+        .invoke_handler(tauri::generate_handler![
+            get_world_state,
+            submit_action,
+            verify_claim,
+            get_recent_events
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
