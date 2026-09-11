@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Co-Work Assistant</title>
+<link rel="stylesheet" href="sidebar.css" />
+</head>
+<body>
+<main aria-label="AI co-work assistant panel">
+  <header>
+    <h1>AI Co-Work</h1>
+    <div class="row">
+      <button id="pauseBtn" aria-label="Pause or resume the agent">Pause agent</button>
+      <button id="forgetBtn" aria-label="Erase agent memory">Forget me</button>
+    </div>
+  </header>
+
+  <section aria-label="Task goal">
+    <label for="goal">Goal</label>
+    <textarea id="goal" rows="3" placeholder="e.g. Fill the checkout form with my saved address"></textarea>
+    <label class="consent">
+      <input type="checkbox" id="consent" />
+      I approve sensitive/destructive steps (purchases, deletions, payments)
+    </label>
+    <button id="runBtn">Run task</button>
+    <p id="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section aria-label="Agent plan and suggestions">
+    <h2>Suggestions &amp; plan</h2>
+    <ul id="trail"></ul>
+  </section>
+
+  <section aria-label="Agent action log">
+    <h2>Action log</h2>
+    <ol id="log"></ol>
+  </section>
+
+  <footer>
+    <small>Human has priority: interacting with the page pauses the agent. Destructive actions need consent.</small>
+  </footer>
+</main>
+<script src="sidebar.js"></script>
+</body>
+</html>
