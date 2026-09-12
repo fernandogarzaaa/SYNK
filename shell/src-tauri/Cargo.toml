@@ -6,7 +6,11 @@ authors = ["Fernando Garza <garza@inan.ai>"]
 edition = "2021"
 
 [build-dependencies]
-tauri-build = "1.5"
+tauri-build = { version = "1.5", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 tauri = { version = "1.5", features = ["dialog-ask", "dialog-confirm", "dialog-message", "shell-open"] }
