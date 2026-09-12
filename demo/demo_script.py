@@ -41,7 +41,7 @@ print("== plan ==")
 plan = post("/plan", {"goal": "Fill the checkout form"})
 print(json.dumps(plan, indent=1)[:800], "\n")
 
-print("== act (bulk) ==")
+print("== act ==")
 res = post("/act", {"actions": plan["actions"],
                     "page_url": "https://demo.shop/checkout",
                     "note": "demo bulk fill"})

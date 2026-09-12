@@ -53,12 +53,19 @@ class Verifier:
                                          reason="WebMCP reported failure", confidence=1.0)
             # If WebMCP says OK, it's strong evidence, but we still check for contradictions
             
-        # 2. URL/Navigation Changes — only when claim states a concrete URL
+        # 2. URL/Navigation Changes — only when the claim is about a URL.
+        # (A field-text claim like a typed value must never conflict with URL
+        # evidence; compare like with like.)
         url_ev = [e for e in relevant_evidence if e.evidence_type in (URL_CHANGE, NAVIGATION)]
         if url_ev:
             last_url = url_ev[-1].payload.get("url")
             claimed = claim.claimed_state
-            if (isinstance(claimed, str) and claimed
+            claimed_is_url = (
+                isinstance(claimed, str) and claimed
+                and (claimed.startswith(("http://", "https://",
+                                         "about:", "chrome:", "/")))
+            )
+            if (claimed_is_url
                     and isinstance(last_url, str) and last_url
                     and last_url != claimed):
                 return VerificationResult(CONFLICTING, [url_ev[-1].evidence_id],

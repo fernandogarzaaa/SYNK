@@ -108,6 +108,34 @@ def test_claim_with_no_evidence(verifier):
     assert result.result == UNVERIFIED
     assert "No relevant evidence observed" in result.reason
 
+def test_url_evidence_ignores_non_url_claim(verifier):
+    """
+    Scenario: agent types text (claimed_state is field text), runtime
+    observes a URL. URL evidence must not conflict with a non-URL claim.
+    """
+    claim = Claim(
+        claim_id="c5",
+        task_id="task_5",
+        actor="agent",
+        claim_type=CLAIM_TYPE_STATE,
+        target="#email",
+        requested_state={"tool": "type"},
+        claimed_state="<value for field 1>",
+        action_ids=["action_5"]
+    )
+    verifier.propose_claim(claim)
+    verifier.record_evidence(Evidence(
+        evidence_id="e5",
+        evidence_type=URL_CHANGE,
+        source="runtime",
+        timestamp=time.time(),
+        action_id="action_5",
+        task_id="task_5",
+        payload={"url": "https://demo.shop/checkout"}
+    ))
+    result = verifier.verify("c5")
+    assert result.result != CONFLICTING
+
 def test_timing_window_expiration(verifier):
     """
     Scenario: Evidence exists but it's too old (outside the 10s window).
