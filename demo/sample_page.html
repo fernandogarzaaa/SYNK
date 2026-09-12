@@ -1,14 +1,31 @@
 <!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Demo checkout form</title></head>
+<head>
+<meta charset="utf-8">
+<title>Demo checkout form</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 2rem auto; padding: 0 1rem; }
+  label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; }
+  input { display: block; width: 100%; min-height: 44px; font-size: 16px; padding: 0.5rem; box-sizing: border-box; }
+  button { display: block; margin-top: 1.5rem; min-height: 48px; min-width: 200px; font-size: 16px; }
+  #confirmation { display: none; margin-top: 1.5rem; padding: 1rem; border: 2px solid green; }
+</style>
+</head>
 <body>
 <h1>Demo shop checkout</h1>
-<form>
-  <label>Email <input id="email" placeholder="Email address" aria-label="Email address"></label>
-  <label>Address <input id="addr" placeholder="Shipping address" aria-label="Shipping address"></label>
-  <button id="submit" type="button">Submit order</button>
+<form id="checkout">
+  <label for="email">Email address</label>
+  <input id="email" placeholder="you@example.com" aria-label="Email address" autocomplete="email">
+  <label for="addr">Shipping address</label>
+  <input id="addr" placeholder="123 Main St" aria-label="Shipping address" autocomplete="street-address">
+  <button id="submit" type="submit">Submit order</button>
 </form>
-<nav>main nav menu</nav>
-<footer>footer links</footer>
+<div id="confirmation" role="status">Order confirmed — thank you!</div>
+<script>
+  document.getElementById('checkout').addEventListener('submit', (e) => {
+    e.preventDefault();
+    document.getElementById('confirmation').style.display = 'block';
+  });
+</script>
 </body>
 </html>
