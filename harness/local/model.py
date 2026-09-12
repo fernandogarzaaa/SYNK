@@ -34,7 +34,8 @@ class MockLocalModel(LocalModel):
         # Mock behavior: if 'escalate' in prompt, simulate low confidence
         # Otherwise simulate a high-confidence structured decision
         confidence = 0.95
-        text = '{"decision": "fill", "ref": 1, "confidence": 0.95}'
+        text = ('{"decision": "fill", "ref": 1, '
+                '"text": "<value for field 1>", "confidence": 0.95}')
         
         if "escalate" in request.prompt.lower():
             confidence = 0.45

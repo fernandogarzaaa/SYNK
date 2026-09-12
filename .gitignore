@@ -14,5 +14,7 @@ Thumbs.db
 node_modules/
 shell/dist/
 shell/build/
-src-tauri/target/
+shell/src-tauri/target/
+shell/src-tauri/WixTools/
+*.node
 *.pyc

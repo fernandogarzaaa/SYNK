@@ -1,9 +1,10 @@
-# AI Co-Work Browser — Beta.1 Prototype
+# SYNK — Human–Agent Co-Work Browser Runtime
 
-Implements **E:\NEW PROJECT.md** + **E:\chatgpt new project.md** (Beta.1 milestone):
+Implements **E:\NEW PROJECT.md** (Alpha → Beta.3 → Phase 2):
 a **collaborative browser runtime** where humans and AI agents operate concurrently
 on the same web session with structured world state, action ownership, workflow
-learning, and **WebMCP semantic fast path**.
+learning, **WebMCP semantic fast path**, an evidence-backed **Truth Layer**,
+and a native **Tauri desktop shell**.
 
 ## Architecture (maps to chatgpt spec §1–25 + Beta.1 WebMCP)
 
@@ -24,14 +25,17 @@ User <-> extension/sidebar <---> harness/server (127.0.0.1:18080) <---> LLM
 ## Quickstart
 
 ```powershell
-# 1. start harness (stdlib only, no install needed)
+# 1. start harness (extension mode; no browser dependency)
 python -m harness.server --port 18080 --db agent_memory.db
+#    CDP mode (requires: pip install playwright; playwright install chromium):
+#    python -m harness.server --port 18080 --use-cdp
 # 2. run unit tests
 python -m unittest discover -s tests -v
 # 3. run headless demo (terminal 2, harness running)
 python demo/demo_script.py
-# 4. load extension in Chrome: chrome://extensions -> Developer mode ->
-#    Load unpacked -> select extension/
+# 4a. load extension in Chrome: chrome://extensions -> Developer mode ->
+#     Load unpacked -> select extension/
+# 4b. desktop shell (requires Rust + Node): cd shell; npm install; npm run tauri dev
 ```
 
 With `OPENAI_API_KEY` set, `/plan` uses a cloud model; otherwise (and for
@@ -124,8 +128,13 @@ planner — the prototype works fully offline.
 - [x] **WebMCP adapter registry (Level 0)**
 - [x] **Capability Registry with risk/ownership/policy**
 - [x] **WebMCP policy-gated execution + verifier**
-- [ ] On-device SLM integration (mlc-llm/WebLLM for Tier 1/2)
-- [ ] Multi-tab parallelism (concurrency across tabs)
+- [x] **Truth Layer wired**: `/act`/`/transact` record Evidence + Claims, verify honestly
+- [x] **Scheduler execution loop**: `/task/submit|poll|run` with deps + tab guards
+- [x] **Real consent flow**: `consent_required` → shell confirm → resubmit consented
+- [x] **Tauri shell compiles** (`cargo check` clean): world/ownership/events UI + consent
+- [x] **EVE validation**: experience run caught + fixed demo defects (29→33, overlaps gone)
+- [x] **Live test green**: snapshot→plan→act→verify, scheduler chain, consent, audit
+- [ ] On-device SLM integration (mlc-llm/WebLLM for Tier 1/2; mock stands in)
 - [ ] Deep Chromium integration (Phase 3+ of chatgpt roadmap)
 
 ## Roadmap

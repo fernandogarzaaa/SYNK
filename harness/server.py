@@ -53,6 +53,27 @@ def _domain_of(url: str) -> str:
         return ""
 
 
+def _normalize_local_decision(decision: dict, goal: str = ""):
+    """Map a local-runtime decision to the fixed tool allowlist.
+
+    Returns a valid action dict, or None when the decision must escalate
+    to the cloud/mock planner instead of emitting an unknown tool.
+    """
+    from .tools import TOOL_SCHEMAS as _SCHEMAS
+    _alias = {"fill": "type"}
+    raw = decision.get("decision", "click")
+    tool = _alias.get(raw, raw)
+    if tool not in _SCHEMAS or tool == "bulk":
+        return None
+    action = {"tool": tool, "intent": goal}
+    if decision.get("ref") is not None:
+        action["ref"] = decision.get("ref")
+    for k in ("text", "value", "url", "selector", "direction", "key"):
+        if decision.get(k) is not None:
+            action[k] = decision.get(k)
+    return action
+
+
 def _claimed_state_for_action(action: dict):
     """Derive a concrete claimed_state for common tools, else None."""
     tool = action.get("tool", action.get("action", ""))
@@ -377,16 +398,10 @@ class Handler(BaseHTTPRequestHandler):
         )
         
         # Local fast path: only when the decision maps to the fixed tool allowlist.
-        from .tools import TOOL_SCHEMAS as _SCHEMAS
-        _alias = {"fill": "type"}
-        _tool = _alias.get(decision.get("decision"), decision.get("decision", "click"))
-        _use_local = (routing_type != 'cloud_llm'
-                      and decision.get("decision") != "escalate"
-                      and _tool in _SCHEMAS and _tool != "bulk")
-        if _use_local:
-            # Local fast path: wrap structured decision into a plan.
-            action = {"tool": _tool, "ref": decision.get("ref"),
-                      "text": decision.get("text", ""), "intent": goal}
+        action = None
+        if routing_type != 'cloud_llm' and decision.get("decision") != "escalate":
+            action = _normalize_local_decision(decision, goal)
+        if action is not None:
             plan = {"actions": [action]}
             plan["routing"] = routing_type
             plan["tier"] = "local-slm"

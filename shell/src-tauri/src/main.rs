@@ -4,7 +4,7 @@ use reqwest::Client;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct HarnessState {
     pub base_url: String,
     pub client: Arc<Client>,
@@ -89,16 +89,14 @@ async fn get_recent_events(state: tauri::State<'_, Arc<Mutex<HarnessState>>>) ->
 
 #[command]
 async fn request_consent(
-    state: tauri::State<'_, Arc<Mutex<HarnessState>>>, 
+    _state: tauri::State<'_, Arc<Mutex<HarnessState>>>,
     action: serde_json::Value
 ) -> Result<bool, String> {
-    // In a real app, this would trigger a tauri::api::dialog::message
-    // For now, we return the result of a simulated native prompt
-    println!("CONSENT REQUIRED for action: {:?}", action);
-    
-    // We will let the frontend handle the actual dialog and call back, 
-    // but we provide this endpoint for the harness to signal a request.
-    Ok(true) 
+    // Consent is collected in the frontend (confirm dialog) which then
+    // resubmits with user_consented=true. This endpoint exists for
+    // harness-initiated signals; default-deny is the safe posture.
+    println!("CONSENT REQUEST (default deny) for action: {:?}", action);
+    Ok(false)
 }
 
 fn main() {
