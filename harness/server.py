@@ -34,10 +34,15 @@ from .world_state import WorldState
 from .local.runtime import LocalRuntime
 from .scheduler.scheduler import ParallelScheduler
 from .verification.verifier import Verifier
+from .verification.claims import Claim
+from .verification.evidence import (
+    Evidence, BROWSER_EVENT, DOM_CHANGE, NAVIGATION, URL_CHANGE,
+)
 from .world_state import WorldState
 from .browser import BrowserController
 import asyncio
 import threading
+import uuid
 
 
 
@@ -46,6 +51,20 @@ def _domain_of(url: str) -> str:
         return url.split("//", 1)[1].split("/", 1)[0].lower()
     except IndexError:
         return ""
+
+
+def _claimed_state_for_action(action: dict):
+    """Derive a concrete claimed_state for common tools, else None."""
+    tool = action.get("tool", action.get("action", ""))
+    if tool == "navigate":
+        return action.get("url")
+    if tool == "type":
+        return action.get("text")
+    if tool == "select":
+        return action.get("value")
+    if tool in ("click", "hover", "focus"):
+        return action.get("target", action.get("selector", action.get("ref")))
+    return None
 
 
 class State:
@@ -105,6 +124,33 @@ class State:
                  "focus.changed", "human.action", "agent.action", "agent.lease",
                  "agent.goal", "dialog.opened", "dialog.closed"):
             self.world.apply_event({"type": t, "data": d})
+        # Truth Layer: runtime observations become immutable Evidence.
+        try:
+            task_id = d.get("task_id")
+            action_id = d.get("action_id")
+            if t in ("page.loaded", "page.navigated") and d.get("url"):
+                self.verifier.record_evidence(Evidence(
+                    evidence_id=f"e_{uuid.uuid4().hex[:8]}",
+                    evidence_type=URL_CHANGE if t == "page.loaded" else NAVIGATION,
+                    source="runtime", timestamp=time.time(),
+                    action_id=action_id, task_id=task_id,
+                    world_state_version=self.world.version,
+                    payload={"url": d.get("url"), "title": d.get("title", ""),
+                             "tab_id": d.get("tab_id", "default")},
+                ))
+            elif t in ("dom.changed", "value.changed") and task_id:
+                self.verifier.record_evidence(Evidence(
+                    evidence_id=f"e_{uuid.uuid4().hex[:8]}",
+                    evidence_type=DOM_CHANGE,
+                    source="runtime", timestamp=time.time(),
+                    action_id=action_id, task_id=task_id,
+                    world_state_version=self.world.version,
+                    payload={"target": d.get("target"),
+                             "state": d.get("detail", d.get("value")),
+                             "tab_id": d.get("tab_id", "default")},
+                ))
+        except Exception:
+            pass
         if t == "human.action":
             if d.get("target"):
                 self.ownership.mark_human(d["target"])
@@ -211,19 +257,36 @@ class Handler(BaseHTTPRequestHandler):
                                     "tier_reason": reason})
         if path == "/benchmark":
             return self._send(200, _run_benchmarks())
-        # Beta.3: Parallel Task Submission
+        # Beta.3: Parallel Task Submission + plan-only execution
         if path == "/task/submit":
             tid = b.get("task_id", "t1")
             tab = b.get("tab_id", "default")
             intent = b.get("intent", "")
             deps = set(b.get("dependencies", []))
-            STATE.scheduler.submit(tid, tab, intent, deps)
-            return self._send(200, {"ok": True, "task_id": tid})
+            try:
+                STATE.scheduler.submit(tid, tab, intent, deps)
+            except ValueError as e:
+                return self._send(409, {"ok": False, "error": str(e)})
+            return self._send(200, {"ok": True, "task_id": tid,
+                                    "ready": len(STATE.scheduler.get_ready_tasks())})
         if path == "/task/poll":
             tid = b.get("task_id", "t1")
             task = STATE.scheduler.tasks.get(tid)
             if not task: return self._send(404, {"error": "not found"})
-            return self._send(200, {"status": task.status, "result": task.result})
+            return self._send(200, {"status": task.status, "result": task.result,
+                                    "tab_id": task.tab_id,
+                                    "dependencies": sorted(task.dependencies)})
+        if path == "/task/run":
+            def _plan_task(task):
+                prompt = STATE.ctx.build_prompt(task.intent, STATE.mem.summary_for_prompt())
+                prompt += "\n" + STATE.world.prompt_section()
+                plan = STATE.llm.plan(task.intent, STATE.safety.mask_pii(prompt),
+                                      STATE.mem.summary_for_prompt())
+                return {"intent": task.intent, "tab_id": task.tab_id, "plan": plan}
+            ran = STATE.scheduler.run_ready(_plan_task)
+            return self._send(200, {"ok": True,
+                                    "ran": [{"task_id": t.task_id, "status": t.status,
+                                             "tab_id": t.tab_id} for t in ran]})
         # Beta.2 Truth Layer endpoints
         if path == "/verification/claim":
             from .verification.claims import Claim
@@ -279,7 +342,9 @@ class Handler(BaseHTTPRequestHandler):
         injected = STATE.safety.detect_injection(flat)
         view = STATE.ctx.ingest(url, nodes, b.get("goal", ""), b.get("screenshot_note", ""))
         STATE.world.load_full(url, view["nodes"], title, tab_id=tab_id)
-        STATE.bus.emit("page.loaded", {"url": url, "title": title, "tab_id": tab_id})
+        STATE.bus.emit("page.loaded", {"url": url, "title": title, "tab_id": tab_id,
+                                       "task_id": b.get("task_id"),
+                                       "action_id": b.get("action_id")})
         view["injection_suspected"] = injected
         view["world_version"] = STATE.world.version
         view["world"] = STATE.world.prompt_section()
@@ -348,31 +413,108 @@ class Handler(BaseHTTPRequestHandler):
         tab_id = b.get("tab_id", "default")
         page_url = b.get("page_url", "")
         consented = bool(b.get("user_consented", False))
+        task_id = b.get("task_id") or f"t_{uuid.uuid4().hex[:8]}"
+        claim_id = b.get("claim_id") or f"c_{uuid.uuid4().hex[:8]}"
         actions = b.get("actions") or ([b["action"]] if "action" in b else [])
+        action_ids = [f"{claim_id}:{i}" for i in range(len(actions))]
         results = [STATE.tools.run(a, page_url, consented, tab_id=tab_id) for a in actions]
-        for a, r in zip(actions, results):
+        now = time.time()
+        for i, (a, r) in enumerate(zip(actions, results)):
             STATE.mem.learn_from_action(a)
             STATE.mem.record(page_url, a, json.dumps(r)[:500], b.get("note", ""))
-            STATE.bus.emit("agent.action", {"command": r.get("command"),
-                                             "target": a.get("target", a.get("ref")),
-                                             "ok": r.get("ok")})
+            target = a.get("target", a.get("selector", a.get("ref")))
+            STATE.bus.emit("agent.action", {"command": r.get("command", a.get("tool")),
+                                            "target": target,
+                                            "ok": r.get("ok"),
+                                            "task_id": task_id,
+                                            "action_id": action_ids[i],
+                                            "tab_id": tab_id})
+            # Honest tool-execution evidence: BROWSER_EVENT only.
+            # Real DOM/URL confirmation must arrive via /snapshot or /event.
+            STATE.verifier.record_evidence(Evidence(
+                evidence_id=f"e_{uuid.uuid4().hex[:8]}",
+                evidence_type=BROWSER_EVENT,
+                source="runtime",
+                timestamp=now,
+                action_id=action_ids[i],
+                task_id=task_id,
+                world_state_version=STATE.world.version,
+                payload={"command": a.get("tool"), "target": target,
+                         "ok": r.get("ok"), "tab_id": tab_id},
+            ))
+        # One claim per /act batch; claimed_state from first action (or explicit override).
+        claimed_state = b.get("claimed_state")
+        if claimed_state is None and actions:
+            claimed_state = _claimed_state_for_action(actions[0])
+        STATE.verifier.propose_claim(Claim(
+            claim_id=claim_id,
+            task_id=task_id,
+            actor="agent",
+            claim_type="ACTION_COMPLETED",
+            target=str(actions[0].get("target", actions[0].get("selector", actions[0].get("ref", "?")))) if actions else "?",
+            requested_state=actions[0] if actions else {},
+            claimed_state=claimed_state,
+            action_ids=action_ids,
+        ))
+        verification = STATE.verifier.verify(claim_id).to_dict()
+        STATE.bus.emit("agent.action_verified", {"claim_id": claim_id, "task_id": task_id,
+                                                 "result": verification.get("result"),
+                                                 "tab_id": tab_id})
         return self._send(200, {"results": results,
-                                 "paused_for_user": STATE.tools.paused_for_user})
+                                "task_id": task_id,
+                                "claim_id": claim_id,
+                                "verification": verification,
+                                "paused_for_user": STATE.tools.paused_for_user})
 
 
     def _transact(self, b: dict):
         """Transactional co-execution: lease -> validate -> execute -> verify."""
+        tab_id = b.get("tab_id", "default")
         page_url = b.get("page_url", "")
         consented = bool(b.get("user_consented", False))
+        task_id = b.get("task_id") or f"t_{uuid.uuid4().hex[:8]}"
+        claim_id = b.get("claim_id") or f"c_{uuid.uuid4().hex[:8]}"
         actions = b.get("actions") or ([b["action"]] if "action" in b else [])
-        results = [STATE.tx.run(a, page_url, consented) for a in actions]
+        action_ids = [f"{claim_id}:{i}" for i in range(len(actions))]
+        results = [STATE.tx.run(a, page_url, consented, tab_id=tab_id) for a in actions]
         conflicts = sum(1 for r in results if r.get("verdict") in ("replan", "request_ownership"))
-        for a, r in zip(actions, results):
+        now = time.time()
+        for i, (a, r) in enumerate(zip(actions, results)):
             STATE.mem.record(page_url, a, json.dumps(r)[:500], b.get("note", "tx"))
+            target = a.get("target", a.get("selector", a.get("ref")))
             STATE.bus.emit("agent.action", {"command": a.get("tool"),
-                                            "target": a.get("target"), "ok": r.get("ok"),
-                                            "verdict": r.get("verdict")})
+                                            "target": target, "ok": r.get("ok"),
+                                            "verdict": r.get("verdict"),
+                                            "task_id": task_id,
+                                            "action_id": action_ids[i],
+                                            "tab_id": tab_id})
+            STATE.verifier.record_evidence(Evidence(
+                evidence_id=f"e_{uuid.uuid4().hex[:8]}",
+                evidence_type=BROWSER_EVENT,
+                source="runtime", timestamp=now,
+                action_id=action_ids[i], task_id=task_id,
+                world_state_version=STATE.world.version,
+                payload={"command": a.get("tool"), "target": target,
+                         "ok": r.get("ok"), "verdict": r.get("verdict"),
+                         "tab_id": tab_id},
+            ))
+        claimed_state = b.get("claimed_state")
+        if claimed_state is None and actions:
+            claimed_state = _claimed_state_for_action(actions[0])
+        STATE.verifier.propose_claim(Claim(
+            claim_id=claim_id, task_id=task_id, actor="agent",
+            claim_type="ACTION_COMPLETED",
+            target=str(actions[0].get("target", actions[0].get("selector", actions[0].get("ref", "?")))) if actions else "?",
+            requested_state=actions[0] if actions else {},
+            claimed_state=claimed_state, action_ids=action_ids,
+        ))
+        verification = STATE.verifier.verify(claim_id).to_dict()
+        STATE.bus.emit("agent.action_verified", {"claim_id": claim_id, "task_id": task_id,
+                                                 "result": verification.get("result"),
+                                                 "tab_id": tab_id})
         return self._send(200, {"results": results, "conflicts": conflicts,
+                                "task_id": task_id, "claim_id": claim_id,
+                                "verification": verification,
                                 "ownership": STATE.ownership.snapshot()})
 
     def _lease(self, b: dict):

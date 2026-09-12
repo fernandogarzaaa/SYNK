@@ -19,7 +19,7 @@ function App() {
   };
 
 
-  const handleAction = async (action) => {
+  const handleAction = async (action, consented = false) => {
     setLoading(true);
     try {
       // Server /act expects {actions:[...], page_url, tab_id, user_consented}
@@ -27,10 +27,21 @@ function App() {
         actions: [action],
         page_url: state.world?.tabs?.[state.world?.active_tab]?.url || "",
         tab_id: state.world?.active_tab || "default",
-        user_consented: false,
+        user_consented: consented,
       };
-      await invoke('submit_action', { body });
+      const res = await invoke('submit_action', { body });
+      const needsConsent = res?.results?.some((r) => r?.consent_required);
+      if (needsConsent && !consented) {
+        const approved = window.confirm(
+          `Destructive action requires consent:\n${JSON.stringify(action)}\n\nApprove?`
+        );
+        if (approved) {
+          return handleAction(action, true);
+        }
+      }
+      if (res?.verification) setVerification(res.verification);
       await refreshWorld();
+      return res;
     } catch (e) {
       console.error("Action failed", e);
     } finally {

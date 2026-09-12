@@ -42,17 +42,23 @@ export const ActionPanel = ({ onAction }) => {
       </div>
       
       <div className="grid grid-cols-2 gap-2">
-        <button 
+        <button
           onClick={() => onAction({ tool: 'snapshot' })}
           className="p-2 bg-slate-800 hover:bg-slate-700 rounded border border-slate-600 text-xs transition-colors"
         >
           Sync State
         </button>
-        <button 
-          onClick={() => onAction({ tool: 'navigate', url: 'https://google.com' })}
+        <button
+          onClick={() => onAction({ tool: 'navigate', url: 'https://example.com' })}
           className="p-2 bg-slate-800 hover:bg-slate-700 rounded border border-slate-600 text-xs transition-colors"
         >
-          Go Google
+          Go example.com
+        </button>
+        <button
+          onClick={() => onAction({ tool: 'click', args: 'delete account test' })}
+          className="col-span-2 p-2 bg-red-900/30 hover:bg-red-900/50 rounded border border-red-900 text-xs transition-colors"
+        >
+          Test destructive (consent demo)
         </button>
       </div>
     </div>

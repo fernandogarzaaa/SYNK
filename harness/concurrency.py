@@ -133,7 +133,7 @@ class TransactionRunner:
         self.safety = safety          # SafetyLayer
 
     def run(self, action: dict, page_url: str = "",
-            user_consented: bool = False) -> dict:
+            user_consented: bool = False, tab_id: str = "default") -> dict:
         target = str(action.get("target", action.get("selector",
                        action.get("ref", "?"))))
         # RESERVE
@@ -155,7 +155,7 @@ class TransactionRunner:
         tool_action = {"tool": action.get("tool", action.get("command", "")),
                        **{k: v for k, v in action.items()
                           if k not in ("target", "intent", "preconditions")}}
-        res = self.tools.run(tool_action, page_url, user_consented)
+        res = self.tools.run(tool_action, page_url, user_consented, tab_id=tab_id)
         # VERIFY
         verified = res.get("ok", False)
         for check in action.get("verification", []):
