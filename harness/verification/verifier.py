@@ -53,13 +53,16 @@ class Verifier:
                                          reason="WebMCP reported failure", confidence=1.0)
             # If WebMCP says OK, it's strong evidence, but we still check for contradictions
             
-        # 2. URL/Navigation Changes
+        # 2. URL/Navigation Changes — only when claim states a concrete URL
         url_ev = [e for e in relevant_evidence if e.evidence_type in (URL_CHANGE, NAVIGATION)]
         if url_ev:
             last_url = url_ev[-1].payload.get("url")
-            if last_url and last_url != claim.claimed_state:
+            claimed = claim.claimed_state
+            if (isinstance(claimed, str) and claimed
+                    and isinstance(last_url, str) and last_url
+                    and last_url != claimed):
                 return VerificationResult(CONFLICTING, [url_ev[-1].evidence_id],
-                                         reason=f"Actual URL {last_url} contradicts claim {claim.claimed_state}")
+                                         reason=f"Actual URL {last_url} contradicts claim {claimed}")
 
         # 3. DOM/State changes — must match claimed_state when claim is specific
         dom_ev = [e for e in relevant_evidence if e.evidence_type == DOM_CHANGE]

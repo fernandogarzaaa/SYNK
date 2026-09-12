@@ -376,9 +376,17 @@ class Handler(BaseHTTPRequestHandler):
             workflow_id=prep.get("workflow_id")
         )
         
-        if routing_type != 'cloud_llm' and decision.get("decision") != "escalate":
-            # Local fast path: wrap structured decision into a plan
-            action = {"tool": decision.get("decision", "click"), "ref": decision.get("ref"), "intent": goal}
+        # Local fast path: only when the decision maps to the fixed tool allowlist.
+        from .tools import TOOL_SCHEMAS as _SCHEMAS
+        _alias = {"fill": "type"}
+        _tool = _alias.get(decision.get("decision"), decision.get("decision", "click"))
+        _use_local = (routing_type != 'cloud_llm'
+                      and decision.get("decision") != "escalate"
+                      and _tool in _SCHEMAS and _tool != "bulk")
+        if _use_local:
+            # Local fast path: wrap structured decision into a plan.
+            action = {"tool": _tool, "ref": decision.get("ref"),
+                      "text": decision.get("text", ""), "intent": goal}
             plan = {"actions": [action]}
             plan["routing"] = routing_type
             plan["tier"] = "local-slm"
