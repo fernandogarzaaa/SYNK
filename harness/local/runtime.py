@@ -6,13 +6,16 @@ import json
 import time
 from typing import Any, Optional, Dict, Tuple
 
-from .model import LocalModel, MockLocalModel, InferenceRequest, InferenceResult
+from .model import (LocalModel, MockLocalModel, EndpointLocalModel,
+                    build_local_model, InferenceRequest, InferenceResult)
 from .cache import DecisionCache
 from .telemetry import LocalTelemetry, DecisionMetric
 
 class LocalRuntime:
     def __init__(self, model: Optional[LocalModel] = None):
-        self.model = model or MockLocalModel()
+        # SYNK_LOCAL_MODEL=endpoint selects a real local server; default mock.
+        # Endpoint failures fail safe: decide() catches per-call errors below.
+        self.model = model or build_local_model()
         self.cache = DecisionCache()
         self.telemetry = LocalTelemetry()
         
@@ -50,11 +53,20 @@ class LocalRuntime:
             ))
             return {"decision": "fill", "ref": "trivial_field", "confidence": 1.0}, 'deterministic'
 
-        # 3. Local SLM (L-1)
+        # 3. Local SLM (L-1) — endpoint failures escalate, never crash the loop
         prompt = f"Site: {site}\nState: {state_sig}\nIntent: {intent}\nDecision?"
         req = InferenceRequest(prompt=prompt, context=ctx)
-        res = self.model.infer(req)
-        
+        try:
+            res = self.model.infer(req)
+        except Exception as e:
+            latency = (time.time() - start_time) * 1000
+            self.telemetry.record(DecisionMetric(
+                type='cloud_llm', latency_ms=latency,
+                was_escalated=True, confidence=0.0
+            ))
+            return {"decision": "escalate", "reason": f"local_model_error: {e}",
+                    "confidence": 0.0}, 'cloud_llm'
+
         try:
             decision = json.loads(res.text)
         except json.JSONDecodeError:

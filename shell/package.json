@@ -2,10 +2,12 @@
   "name": "synk-shell",
   "private": true,
   "version": "0.1.0",
+  "type": "module",
   "scripts": {
-    "tauri": "tauri",
-    "dev": "tauri dev",
-    "build": "tauri build"
+    "dev": "vite --port 1420",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
   },
   "dependencies": {
     "react": "^18.2.0",
