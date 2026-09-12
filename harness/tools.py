@@ -38,11 +38,19 @@ class ToolExecutor:
         """When the user clicks/types, pause the agent (conflict resolution)."""
         self.paused_for_user = active
 
+    def _use_cdp(self) -> bool:
+        try:
+            from .server import STATE
+            return bool(getattr(STATE, "use_cdp", False) and self.browser is not None
+                        and getattr(self.browser, "available", False))
+        except Exception:
+            return False
+
     def run(self, action: dict, page_url: str = "",
                 user_consented: bool = False, tab_id: str = "default") -> dict:
         tool = action.get("tool", action.get("action", ""))
         if tool not in TOOL_SCHEMAS:
-            res = {"ok": False, "error": f"unknown tool '{tool}'"}
+            res = {"ok": False, "error": "denied:unknown-tool"}
             self.safety.log(action, "denied:unknown-tool")
             return res
         if tool == "bulk":
@@ -51,30 +59,37 @@ class ToolExecutor:
             action, page_url, user_consented, self.paused_for_user)
         self.safety.log(action, reason if not ok else f"executed:{tool}")
         if not ok:
+            if reason == "consent_required":
+                return {"ok": False, "error": "consent_required",
+                        "consent_required": True, "tool": tool}
             return {"ok": False, "error": reason}
-            
-        # Phase 2: Direct CDP Execution
-        if self.browser:
+
+        # Phase 2: Direct CDP Execution (only click/type/navigate supported).
+        if self._use_cdp():
+            if tool not in ("click", "type", "navigate"):
+                return {"ok": False,
+                        "error": f"cdp_unsupported:{tool} (use extension mode)"}
             try:
                 import asyncio
-                # We assume the browser's loop is managed by the server.State
                 from .server import STATE
-                
+
                 async def execute():
+                    # CDP uses CSS selectors; extension uses selector field.
+                    sel = action.get("selector") or action.get("ref")
                     if tool == "click":
-                        await STATE.browser.click(tab_id, action.get("ref"))
+                        await STATE.browser.click(tab_id, sel)
                     elif tool == "type":
-                        await STATE.browser.type(tab_id, action.get("ref"), action.get("text"))
+                        await STATE.browser.type(tab_id, sel, action.get("text", ""))
                     elif tool == "navigate":
-                        await STATE.browser.navigate(tab_id, action.get("url"))
+                        await STATE.browser.navigate(tab_id, action.get("url", ""))
                     return {"ok": True, "command": tool, "args": action}
 
                 future = asyncio.run_coroutine_threadsafe(execute(), STATE.loop)
-                return future.result()
+                return future.result(timeout=15)
             except Exception as e:
                 return {"ok": False, "error": f"CDP execution failed: {str(e)}"}
 
-        # Fallback to extension-style command
+        # Extension mode: harness validates + queues; content script executes.
         cmd = {"ok": True, "command": tool,
                "args": {k: action.get(k) for k in TOOL_SCHEMAS[tool] if k in action},
                "safety": reason}
@@ -87,28 +102,34 @@ class ToolExecutor:
         allowed, denied = self.safety.validate_bulk(
             actions, page_url=page_url, user_consented=user_consented,
             paused_for_user=self.paused_for_user)
-        
-        # Phase 2: Direct CDP Bulk Execution
-        if self.browser:
+
+        # Phase 2: Direct CDP Bulk Execution (fail closed on unsupported tools)
+        if self._use_cdp():
+            unsupported = [a for a in allowed if a.get("tool") not in ("click", "type", "navigate")]
+            if unsupported:
+                return {"ok": False,
+                        "error": f"cdp_unsupported:{[a.get('tool') for a in unsupported]}",
+                        "denied": denied + unsupported}
             try:
                 import asyncio
                 from .server import STATE
-                
+
                 async def execute_bulk():
                     results = []
                     for a in allowed:
                         tool = a.get("tool")
+                        sel = a.get("selector") or a.get("ref")
                         if tool == "click":
-                            await STATE.browser.click(tab_id, a.get("ref"))
+                            await STATE.browser.click(tab_id, sel)
                         elif tool == "type":
-                            await STATE.browser.type(tab_id, a.get("ref"), a.get("text"))
+                            await STATE.browser.type(tab_id, sel, a.get("text", ""))
                         elif tool == "navigate":
-                            await STATE.browser.navigate(tab_id, a.get("url"))
+                            await STATE.browser.navigate(tab_id, a.get("url", ""))
                         results.append({"tool": tool, "ok": True})
                     return results
 
                 future = asyncio.run_coroutine_threadsafe(execute_bulk(), STATE.loop)
-                executed_cmds = future.result()
+                executed_cmds = future.result(timeout=20)
                 return {"ok": True, "command": "bulk", "executed": executed_cmds,
                         "denied": denied, "savings_note": "CDP bulk execution"}
             except Exception as e:

@@ -61,17 +61,45 @@ class Verifier:
                 return VerificationResult(CONFLICTING, [url_ev[-1].evidence_id],
                                          reason=f"Actual URL {last_url} contradicts claim {claim.claimed_state}")
 
-        # 3. DOM/State changes
+        # 3. DOM/State changes — must match claimed_state when claim is specific
         dom_ev = [e for e in relevant_evidence if e.evidence_type == DOM_CHANGE]
-        # ... further deterministic checks ...
+        if dom_ev:
+            last = dom_ev[-1].payload
+            actual = last.get("state", last.get("text", last.get("value")))
+            claimed = claim.claimed_state
+            # Only enforce when both sides are concrete scalars (avoid false conflicts)
+            if (isinstance(claimed, (str, int, float, bool)) and claimed not in ("", None)
+                    and isinstance(actual, (str, int, float, bool)) and actual not in ("", None)):
+                if str(actual) != str(claimed):
+                    return VerificationResult(CONFLICTING, [dom_ev[-1].evidence_id],
+                                              reason=f"DOM state {actual!r} contradicts claim {claimed!r}")
 
-        # 4. Final decision: If we have a strong positive signal and no contradictions
-        if webmcp_ev or url_ev or dom_ev:
-            return VerificationResult(VERIFIED, 
-                                   [e.evidence_id for e in relevant_evidence], 
-                                   reason="Deterministic evidence supports claim",
-                                   confidence=0.95,
-                                   timestamp=time.time())
+        # 4. Final decision: require a positive signal, never auto-verify on presence alone
+        if webmcp_ev and not url_ev and not dom_ev:
+            # WebMCP ok=True with no contradiction is sufficient
+            return VerificationResult(VERIFIED,
+                                      [e.evidence_id for e in relevant_evidence],
+                                      reason="WebMCP ok with no contradictions",
+                                      confidence=0.9,
+                                      timestamp=time.time())
+        if (url_ev or dom_ev) and claim.claimed_state:
+            # URL/DOM present but did not contradict above; check explicit match
+            matched = False
+            if url_ev and url_ev[-1].payload.get("url") == claim.claimed_state:
+                matched = True
+            if dom_ev:
+                last = dom_ev[-1].payload
+                actual = last.get("state", last.get("text", last.get("value")))
+                if actual is not None and str(actual) == str(claim.claimed_state):
+                    matched = True
+            if matched:
+                return VerificationResult(VERIFIED,
+                                          [e.evidence_id for e in relevant_evidence],
+                                          reason="Evidence matches claimed_state",
+                                          confidence=0.9,
+                                          timestamp=time.time())
+            return VerificationResult(UNVERIFIED,
+                                      reason="Evidence present but does not match claimed_state")
 
         return VerificationResult(UNVERIFIED, reason="Insufficient evidence to verify")
 

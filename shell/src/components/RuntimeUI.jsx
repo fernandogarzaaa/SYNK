@@ -2,25 +2,30 @@ import React from 'react';
 import { Play, ShieldCheck, Globe, AlertTriangle } from 'lucide-react';
 
 export const WorldStateView = ({ world, ownership }) => {
+  const activeTab = world?.active_tab || "default";
+  const activeUrl = world?.tabs?.[activeTab]?.url || "N/A";
+  const lockCount = ownership ? Object.keys(ownership).length : 0;
   return (
     <div className="p-4 bg-slate-900 text-slate-100 rounded-lg border border-slate-700">
       <div className="flex items-center gap-2 mb-4 text-blue-400">
         <Globe size={18} />
         <h3 className="font-bold uppercase text-xs tracking-wider">World State</h3>
       </div>
-      
+
       <div className="space-y-2 text-sm">
         <div className="flex justify-between items-center p-2 bg-slate-800 rounded">
-          <span className="text-slate-400">Current URL</span>
-          <span className="font-mono text-xs truncate ml-4">{world?.url || 'N/A'}</span>
+          <span className="text-slate-400">Active tab</span>
+          <span className="font-mono text-xs truncate ml-4">{activeTab} (v{world?.version ?? "?"})</span>
         </div>
-        
         <div className="flex justify-between items-center p-2 bg-slate-800 rounded">
-          <span className="text-slate-400">Ownership</span>
-          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-            ownership?.human_owned ? 'bg-orange-500 text-white' : 'bg-green-500 text-white'
-          }`}>
-            {ownership?.human_owned ? 'HUMAN' : 'AGENT'}
+          <span className="text-slate-400">Current URL</span>
+          <span className="font-mono text-xs truncate ml-4">{activeUrl}</span>
+        </div>
+
+        <div className="flex justify-between items-center p-2 bg-slate-800 rounded">
+          <span className="text-slate-400">Active locks</span>
+          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-700 text-slate-200">
+            {lockCount}
           </span>
         </div>
       </div>

@@ -43,17 +43,34 @@ async fn get_world_state(state: tauri::State<'_, Arc<Mutex<HarnessState>>>) -> R
 
 #[command]
 async fn submit_action(
-    state: tauri::State<'_, Arc<Mutex<HarnessState>>>, 
-    action: serde_json::Value
+    state: tauri::State<'_, Arc<Mutex<HarnessState>>>,
+    body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let s = state.lock().await;
     let url = format!("{}/act", s.base_url);
-    
-    let res = s.client.post(&url).json(&action).send().await
+
+    let res = s.client.post(&url).json(&body).send().await
         .map_err(|e| e.to_string())?
         .json::<serde_json::Value>().await
         .map_err(|e| e.to_string())?;
-        
+
+    Ok(res)
+}
+
+#[command]
+async fn verify_claim(
+    state: tauri::State<'_, Arc<Mutex<HarnessState>>>,
+    claim_id: String,
+) -> Result<VerificationResult, String> {
+    let s = state.lock().await;
+    let url = format!("{}/verification/verify", s.base_url);
+
+    let payload = serde_json::json!({ "claim_id": claim_id });
+    let res = s.client.post(&url).json(&payload).send().await
+        .map_err(|e| e.to_string())?
+        .json::<VerificationResult>().await
+        .map_err(|e| e.to_string())?;
+
     Ok(res)
 }
 

@@ -10,7 +10,7 @@ export const OwnershipMonitor = ({ ownership }) => {
     );
   }
 
-  // Assuming ownership is a map of target -> owner ('human' | 'agent')
+  // Server returns {target: state} with FREE/HUMAN_OWNED/AGENT_OWNED/CONFLICT
   const entries = Object.entries(ownership);
 
   return (
@@ -21,19 +21,19 @@ export const OwnershipMonitor = ({ ownership }) => {
       </div>
       
       <div className="space-y-2">
-        {entries.map(([target, owner]) => (
+        {entries.map(([target, state]) => (
           <div key={target} className="flex justify-between items-center p-2 bg-slate-800 rounded text-xs">
             <span className="font-mono text-slate-400 truncate mr-4">{target}</span>
             <div className="flex items-center gap-2">
-              {owner === 'human' ? (
+              {state === 'HUMAN_OWNED' || state === 'CONFLICT' ? (
                 <>
                   <User size={12} className="text-blue-400" />
-                  <span className="text-blue-400 font-bold uppercase text-[10px]">Human</span>
+                  <span className="text-blue-400 font-bold uppercase text-[10px]">{state}</span>
                 </>
               ) : (
                 <>
                   <Bot size={12} className="text-purple-400" />
-                  <span className="text-purple-400 font-bold uppercase text-[10px]">Agent</span>
+                  <span className="text-purple-400 font-bold uppercase text-[10px]">{state}</span>
                 </>
               )}
             </div>

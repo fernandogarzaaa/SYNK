@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          # playwright is optional (CDP mode only); extension mode works without it
+
+      - name: Compile check
+        run: python -m compileall -q harness tests benchmark demo
+
+      - name: Unit tests (unittest)
+        run: python -m unittest discover -s tests -v
+
+      - name: Adversarial truth-layer tests (pytest)
+        run: python -m pytest tests/test_truth_layer_adversarial.py -v
+
+      - name: Server import smoke test (extension mode, no playwright)
+        run: python -c "import harness.server; assert hasattr(harness.server.STATE, 'use_cdp'); print('server import ok')"
+
+      - name: Ensure no bytecode tracked
+        run: |
+          if git ls-files | grep -E '__pycache__|\.pyc$'; then
+            echo "tracked bytecode found"; exit 1
+          fi
+
+  shell-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tauri handler/command parity
+        run: |
+          python - <<'PY'
+          import re, pathlib
+          main = pathlib.Path("shell/src-tauri/src/main.rs").read_text()
+          invoked = re.findall(r'generate_handler!\[(.*?)\]', main, re.S)[0]
+          handlers = {h.strip() for h in invoked.split(',') if h.strip()}
+          defined = set(re.findall(r'async fn (\w+)\(', main))
+          missing = handlers - defined
+          assert not missing, f"Tauri handlers referenced but not defined: {missing}"
+          print("tauri handlers ok:", sorted(handlers))
+          PY
+
+      - name: Frontend invoke parity
+        run: |
+          python - <<'PY'
+          import re, pathlib
+          rs = pathlib.Path("shell/src-tauri/src/main.rs").read_text()
+          defined = set(re.findall(r'async fn (\w+)\(', rs))
+          # strip snake_case vs camelCase: frontend uses snake_case names from Rust
+          ok = True
+          for f in pathlib.Path("shell/src").rglob("*.jsx"):
+              for m in re.findall(r"invoke\('([^']+)'", f.read_text()):
+                  # verify_claim maps to verify_claim, etc.
+                  assert m in defined, f"{f}: invoke('{m}') has no Rust command"
+          print("frontend invoke parity ok")
+          PY

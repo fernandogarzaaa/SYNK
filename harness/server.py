@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
@@ -48,10 +49,19 @@ def _domain_of(url: str) -> str:
 
 
 class State:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, use_cdp: bool = False):
         self.safety = SafetyLayer(SafetyConfig())
         self.ctx = ContextManager()
         self.mem = MemoryStore(db_path)
+        # Phase 2: CDP Browser Controller (must exist before ToolExecutor).
+        # Default off: extension push mode. Enable with use_cdp=True.
+        self.use_cdp = use_cdp
+        self.browser = BrowserController(headless=False)
+        self.loop = asyncio.new_event_loop()
+        self.browser_thread = None
+        if self.use_cdp:
+            self.browser_thread = threading.Thread(target=self._run_event_loop, daemon=True)
+            self.browser_thread.start()
         self.tools = ToolExecutor(self.safety, browser=self.browser)
         self.llm = Orchestrator()
 
@@ -77,12 +87,6 @@ class State:
         self.scheduler = ParallelScheduler(self.ownership)
         # Beta.2 Truth Layer: Independent Verifier
         self.verifier = Verifier(self.world)
-        # Phase 2: CDP Browser Controller
-        self.browser = BrowserController(headless=False)
-        self.loop = asyncio.new_event_loop()
-        self.browser_thread = threading.Thread(target=self._run_event_loop, daemon=True)
-        self.browser_thread.start()
-        
         # Use the ladder with WebMCP integration
         self.ladder = ExecutionLadder(webmcp_adapter=self.webmcp_adapter)
 
@@ -162,13 +166,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"levels": STATE.ladder.describe()})
         if path == "/workflows":
             return self._send(200, {"workflows": STATE.wfmem.all_workflows()})
-        # Beta.1: WebMCP endpoints
-        if path == "/webmcp/discover":
-            return self._webmcp_discover(b)
+        # Beta.1: WebMCP GET = list-only, no body
         if path == "/webmcp/capabilities":
-            return self._webmcp_capabilities(b)
-        if path == "/webmcp/execute":
-            return self._webmcp_execute(b)
+            return self._webmcp_capabilities({})
         return self._send(404, {"ok": False, "error": "not found"})
 
     # -- POST -------------------------------------------------------------------
@@ -259,21 +259,27 @@ class Handler(BaseHTTPRequestHandler):
     # -- handlers ------------------------------------------------------------------
     def _snapshot(self, b: dict):
         tab_id = b.get("tab_id", "default")
-        # Phase 2: CDP Snapshot
-        future = asyncio.run_coroutine_threadsafe(
-            STATE.browser.snapshot(tab_id), STATE.loop
-        )
-        snap = future.result()
-        
-        url = snap["url"]
-        nodes = snap["nodes"]
+        title = b.get("title", "")
+        if STATE.use_cdp:
+            # Phase 2: CDP pull mode
+            future = asyncio.run_coroutine_threadsafe(
+                STATE.browser.snapshot(tab_id), STATE.loop
+            )
+            snap = future.result(timeout=15)
+            url = snap["url"]
+            nodes = snap["nodes"]
+            title = snap.get("title", "")
+        else:
+            # Extension push mode (default): body carries url/nodes
+            url = b.get("url", "")
+            nodes = b.get("nodes", [])
         for i, n in enumerate(nodes):
             n.setdefault("index", i)
         flat = json.dumps(nodes)[:20000]
         injected = STATE.safety.detect_injection(flat)
         view = STATE.ctx.ingest(url, nodes, b.get("goal", ""), b.get("screenshot_note", ""))
-        STATE.world.load_full(url, view["nodes"], snap["title"])
-        STATE.bus.emit("page.loaded", {"url": url, "title": snap["title"]})
+        STATE.world.load_full(url, view["nodes"], title, tab_id=tab_id)
+        STATE.bus.emit("page.loaded", {"url": url, "title": title, "tab_id": tab_id})
         view["injection_suspected"] = injected
         view["world_version"] = STATE.world.version
         view["world"] = STATE.world.prompt_section()
@@ -287,14 +293,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _plan(self, b: dict):
         goal = b.get("goal", "")
-        url = (STATE.world.page.get("url") or "")
+        url = STATE.world.tabs.get(STATE.world.active_tab, {}).get("url", "")
         domain = _domain_of(url)
         prep = STATE.wfmem.prepare(domain, goal)
         tier, tier_reason = pick_tier(goal, workflow_matched=prep["matched"])
         level, level_reason, _ = STATE.ladder.choose_level(domain, goal)
         
         # Beta.2: Local Decision Path
-        state_sig = f"v{STATE.world.version}:{hash(json.dumps(STATE.world.page))}"
+        start_time = time.time()
+        page_state = getattr(STATE.world, "page", None)
+        if page_state is None:
+            # WorldState uses tabs dict; fall back to active tab
+            page_state = STATE.world.tabs.get(STATE.world.active_tab, {})
+        state_sig = f"v{STATE.world.version}:{hash(json.dumps(page_state, sort_keys=True, default=str))}"
         decision, routing_type = STATE.local_runtime.decide(
             site=domain, state_sig=state_sig, intent=goal,
             workflow_id=prep.get("workflow_id")
@@ -507,12 +518,14 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=18080)
     ap.add_argument("--db", default=":memory:")
+    ap.add_argument("--use-cdp", action="store_true",
+                    help="Enable CDP browser control (requires playwright). Default: extension mode.")
     args = ap.parse_args()
     global STATE
-    STATE = State(args.db)
+    STATE = State(args.db, use_cdp=args.use_cdp)
     STATE._human_steps = []
     srv = HTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"ai-cowork harness on http://127.0.0.1:{args.port} (db={args.db})")
+    print(f"ai-cowork harness on http://127.0.0.1:{args.port} (db={args.db} use_cdp={args.use_cdp})")
     srv.serve_forever()
 
 

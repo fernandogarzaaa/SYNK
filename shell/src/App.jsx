@@ -22,7 +22,14 @@ function App() {
   const handleAction = async (action) => {
     setLoading(true);
     try {
-      await invoke('submit_action', { action });
+      // Server /act expects {actions:[...], page_url, tab_id, user_consented}
+      const body = {
+        actions: [action],
+        page_url: state.world?.tabs?.[state.world?.active_tab]?.url || "",
+        tab_id: state.world?.active_tab || "default",
+        user_consented: false,
+      };
+      await invoke('submit_action', { body });
       await refreshWorld();
     } catch (e) {
       console.error("Action failed", e);
