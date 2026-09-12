@@ -29,6 +29,9 @@ User <-> extension/sidebar <---> harness/server (127.0.0.1:18080) <---> LLM
 python -m harness.server --port 18080 --db agent_memory.db
 #    CDP mode (requires: pip install playwright; playwright install chromium):
 #    python -m harness.server --port 18080 --use-cdp
+#    Real local SLM (see docs/local-models.md):
+#    $env:SYNK_LOCAL_MODEL='endpoint'
+#    $env:SYNK_LOCAL_MODEL_URL='http://127.0.0.1:8090/v1/chat/completions'
 # 2. run unit tests
 python -m unittest discover -s tests -v
 # 3. run headless demo (terminal 2, harness running)

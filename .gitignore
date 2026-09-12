@@ -17,4 +17,6 @@ shell/build/
 shell/src-tauri/target/
 shell/src-tauri/WixTools/
 *.node
+benchmark/results.json
+.eve-output/
 *.pyc

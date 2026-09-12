@@ -36,7 +36,7 @@ from .scheduler.scheduler import ParallelScheduler
 from .verification.verifier import Verifier
 from .verification.claims import Claim
 from .verification.evidence import (
-    Evidence, BROWSER_EVENT, DOM_CHANGE, NAVIGATION, URL_CHANGE,
+    Evidence, BROWSER_EVENT, DOM_CHANGE, NAVIGATION, SCREENSHOT, URL_CHANGE,
 )
 from .world_state import WorldState
 from .browser import BrowserController
@@ -331,6 +331,42 @@ class Handler(BaseHTTPRequestHandler):
             tid = b.get("task_id", "t1")
             evs = STATE.verifier.get_evidence_for_task(tid)
             return self._send(200, {"evidence": [e.to_dict() for e in evs]})
+        # L3 selective vision: capture a screenshot as immutable Evidence.
+        # CDP mode captures directly; extension mode accepts pushed PNG base64.
+        if path == "/vision/capture":
+            import base64
+            import hashlib
+            tab_id = b.get("tab_id", "default")
+            task_id = b.get("task_id")
+            png = None
+            if STATE.use_cdp:
+                fut = asyncio.run_coroutine_threadsafe(
+                    STATE.browser.screenshot(tab_id), STATE.loop)
+                png = fut.result(timeout=15)
+            elif b.get("image_base64"):
+                png = base64.b64decode(b["image_base64"])
+            else:
+                return self._send(400, {"ok": False, "error":
+                    "no browser source: enable --use-cdp or push image_base64"})
+            digest = hashlib.sha256(png).hexdigest()
+            ev = Evidence(
+                evidence_id=f"e_{uuid.uuid4().hex[:8]}",
+                evidence_type=SCREENSHOT,
+                source="runtime", timestamp=time.time(),
+                action_id=b.get("action_id"), task_id=task_id,
+                world_state_version=STATE.world.version,
+                payload={"sha256": digest, "bytes": len(png),
+                         "tab_id": tab_id,
+                         "image_base64": base64.b64encode(png).decode()
+                         if len(png) <= 1_500_000 else None},
+            )
+            STATE.verifier.record_evidence(ev)
+            STATE.bus.emit("page.screenshot", {"sha256": digest, "tab_id": tab_id,
+                                               "task_id": task_id})
+            d = ev.to_dict()
+            if d["payload"]["image_base64"] is None:
+                d["payload"]["image_base64"] = "<omitted: >1.5MB>"
+            return self._send(200, {"ok": True, "evidence": d})
         # Beta.1: WebMCP endpoints
         if path == "/webmcp/discover":
             return self._webmcp_discover(b)
@@ -383,7 +419,8 @@ class Handler(BaseHTTPRequestHandler):
         domain = _domain_of(url)
         prep = STATE.wfmem.prepare(domain, goal)
         tier, tier_reason = pick_tier(goal, workflow_matched=prep["matched"])
-        level, level_reason, _ = STATE.ladder.choose_level(domain, goal)
+        level, level_reason, _ = STATE.ladder.choose_level(
+            domain, goal, vision_available=STATE.use_cdp)
         
         # Beta.2: Local Decision Path
         start_time = time.time()

@@ -135,6 +135,11 @@ class BrowserController:
             "nodes": nodes,
         }
 
+    async def screenshot(self, tab_id: str = "default") -> bytes:
+        """Capture a PNG screenshot of the tab (L3 selective vision)."""
+        page = await self._require_page(tab_id)
+        return await page.screenshot(type="png")
+
     async def stop(self):
         if self.browser:
             await self.browser.close()
