@@ -52,13 +52,56 @@ async function capture(tabId, windowId, goal = "", extra = {}) {
 }
 
 async function executeOnPage(tabId, action) {
-  // One mutation on the pinned tab. The returned result is the BROWSER's
-  // actual report (ok / error) -- not an acknowledgement.
-  return chrome.tabs.sendMessage(Number(tabId), {
-    type: "EXECUTE",
+  // Stage D: one mutation on the pinned tab, with explicit frame targeting.
+  // EXECUTE is broadcast to every content-script frame in the tab; exactly
+  // one frame (the one whose FRAME_ID matches target.frame_id) performs the
+  // robust primitive and replies with a BROWSER_ACK carrying the OBSERVED
+  // POST-STATE. This function normalizes whatever the frame returns into a
+  // canonical ack -- and NEVER claims execution without ack.executed===true.
+  const target = {
+    frame_id: action.frame_id || "main",
+    frame_chain: action.frame_chain || ["main"],
+    shadow_path: action.shadow_path || [],
+    locator: { strategy: "css", value: action.selector || "" },
+  };
+  let raw;
+  try {
+    raw = await chrome.tabs.sendMessage(Number(tabId), {
+      type: "EXECUTE",
+      command: action.tool,
+      target,
+      args: { ...action, selector: action.selector || action.target },
+      action_id: action.action_id,
+    });
+  } catch (e) {
+    return { ack: true, action_id: action.action_id || null,
+      command: action.tool, accepted: false, executed: false,
+      observed: null, error: `content script: ${e.message}`,
+      error_code: "FRAME_GONE", tab_id: String(tabId),
+      window_id: null, frame_id: target.frame_id };
+  }
+  if (!raw || raw.ack !== true) {
+    // No content-script frame replied (frame navigated away mid-action or
+    // the extension context was torn down). Fail closed: NOT executed.
+    return { ack: true, action_id: action.action_id || null,
+      command: action.tool, accepted: false, executed: false,
+      observed: null,
+      error: "no ack from content script (frame gone or browser closed)",
+      error_code: "FRAME_GONE", tab_id: String(tabId),
+      window_id: null, frame_id: target.frame_id };
+  }
+  return { ack: true,
+    ack_id: raw.ack_id || null,
+    action_id: action.action_id || null,
     command: action.tool,
-    args: { ...action, selector: action.selector || action.target },
-  });
+    accepted: raw.accepted === true,
+    executed: raw.executed === true,
+    observed: raw.observed || null,
+    error: raw.error || null,
+    error_code: raw.error_code || null,
+    tab_id: raw.tab_id || String(tabId),
+    window_id: raw.window_id || null,
+    frame_id: raw.frame_id || target.frame_id };
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
@@ -142,12 +185,17 @@ async function runTask(goal, opts = {}) {
 
     if (next.decision === "act") {
       const action = next.action || {};
-      // EXECUTE: exactly one mutation on the pinned tab.
-      let browserResult;
+      // EXECUTE: exactly one mutation on the pinned tab. The returned ack
+      // is the BROWSER's own report -- executed===true only comes with an
+      // observed post-state, never from our say-so.
+      let ack;
       try {
-        browserResult = await executeOnPage(tabId, action);
+        ack = await executeOnPage(tabId, action);
       } catch (e) {
-        browserResult = { ok: false, error: `content script: ${e.message}` };
+        ack = { ack: true, action_id: action.action_id || null,
+          command: action.tool, accepted: false, executed: false,
+          observed: null, error: `content script: ${e.message}`,
+          error_code: "FRAME_GONE" };
       }
 
       // OBSERVE again: the post-action snapshot is the evidence the
@@ -164,14 +212,20 @@ async function runTask(goal, opts = {}) {
                  trail, task_id: taskId };
       }
 
-      // VERIFY + DECIDE (server side).
+      // VERIFY + DECIDE (server side). The ack is forwarded verbatim so
+      // /agent/report can record the browser acknowledgement as evidence
+      // BEFORE the verifier judges the post-action snapshot. Status is
+      // "executed" only when the browser ack says executed===true.
       const report = await tryReport(
         taskId, next.action_id, next.claim_id,
-        browserResult?.ok ? "executed" : "browser_failed",
-        browserResult?.ok ? {} : { reason: browserResult?.error || "unknown browser error" });
+        ack.executed ? "executed" : "browser_failed",
+        ack.executed ? { browser_ack: ack }
+                     : { reason: ack.error || "unknown browser error",
+                         error_code: ack.error_code, browser_ack: ack });
       note("report", { decision: report?.decision, reason: report?.reason,
                        verification: report?.verification?.result,
-                       verified: report?.verified });
+                       verified: report?.verified,
+                       ack_executed: ack.executed });
       if (report?.decision === "request-human") {
         return { ok: true, needsUser: true, trail, task_id: taskId,
                  question: report.reason, verified: report.verified };

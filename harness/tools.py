@@ -6,7 +6,6 @@ in one LLM round-trip (spec 8: -74% tool calls).
 from __future__ import annotations
 
 from .safety import SafetyLayer
-
 TOOL_SCHEMAS = {
     "click": ["ref"],
     "type": ["ref", "text"],
@@ -26,6 +25,56 @@ TOOL_SCHEMAS = {
 }
 
 
+def _resolve_target(action: dict, tab_id: str, page_url: str = ""):
+    """Resolve an action's addressing to an ElementTarget (Stage D).
+
+    Raises RuntimeError on unresolvable refs so the CDP path fails closed
+    instead of feeding an opaque ref integer to the browser.
+    """
+    from .ref_resolver import resolve_action_target, RefResolutionError
+    from .server import STATE
+    try:
+        return resolve_action_target(
+            action, STATE.ctx, tab_id=tab_id,
+            session_id=action.get("session_id"),
+            window_id=action.get("window_id", "win_default"),
+            frame_id=action.get("frame_id", "main"),
+            page_url=page_url)
+    except RefResolutionError as e:
+        raise RuntimeError(f"stale_ref: {e}")
+
+
+def _dispatch_runtime(runtime, tool: str, target, action: dict,
+                      tab_id: str) -> dict:
+    """Dispatch one tool through a connected BrowserRuntime.
+
+    Returns a plain dict; the BrowserAck inside carries executed=True
+    only together with its observation (honest ack semantics).
+    """
+    aid = action.get("action_id")
+    if tool == "click":
+        ack = runtime.click(target, action_id=aid)
+    elif tool == "type":
+        ack = runtime.type(target, action.get("text", ""), action_id=aid)
+    elif tool == "select":
+        ack = runtime.select(target, action.get("value", ""), action_id=aid)
+    elif tool == "navigate":
+        ack = runtime.navigate(action.get("url", ""), tab_id=tab_id,
+                               action_id=aid)
+    elif tool == "scroll":
+        ack = runtime.scroll(tab_id=tab_id,
+                             direction=action.get("direction", "down"),
+                             action_id=aid)
+    elif tool == "press_key":
+        ack = runtime.keypress(target, action.get("key", "Enter"),
+                               action_id=aid)
+    else:
+        raise RuntimeError(f"cdp_unsupported:{tool}")
+    return {"ok": ack.executed, "command": tool, "args": action,
+            "ack": ack.to_dict(), "error": ack.error,
+            "error_code": ack.error_code}
+
+
 class ToolExecutor:
     def __init__(self, safety: SafetyLayer | None = None, browser=None):
         self.safety = safety or SafetyLayer()
@@ -41,7 +90,9 @@ class ToolExecutor:
     def _use_cdp(self) -> bool:
         try:
             from .server import STATE
-            return bool(getattr(STATE, "use_cdp", False) and self.browser is not None
+            owned = bool(getattr(STATE, "use_cdp", False)
+                         or getattr(STATE, "cdp_endpoint", ""))
+            return bool(owned and self.browser is not None
                         and getattr(self.browser, "available", False))
         except Exception:
             return False
@@ -64,28 +115,46 @@ class ToolExecutor:
                         "consent_required": True, "tool": tool}
             return {"ok": False, "error": reason}
 
-        # Phase 2: Direct CDP Execution (only click/type/navigate supported).
+        # Stage D: CDP execution routes through the RefResolver -- an opaque
+        # agent ref is NEVER stringified into a selector (the old
+        # `sel = action.get("selector") or action.get("ref")` fed
+        # page.click("3") for ref=3). Unresolvable refs fail closed here.
         if self._use_cdp():
-            if tool not in ("click", "type", "navigate"):
+            if tool not in ("click", "type", "navigate", "select",
+                            "scroll", "press_key"):
                 return {"ok": False,
                         "error": f"cdp_unsupported:{tool} (use extension mode)"}
             try:
                 import asyncio
                 from .server import STATE
+                target = _resolve_target(action, tab_id, page_url)
 
                 async def execute():
-                    # CDP uses CSS selectors; extension uses selector field.
-                    sel = action.get("selector") or action.get("ref")
+                    runtime = getattr(STATE, "browser_runtime", None)
+                    if runtime is not None and runtime.connected:
+                        return await asyncio.to_thread(
+                            _dispatch_runtime, runtime, tool, target,
+                            action, tab_id)
+                    # Fallback: legacy shim with the RESOLVED locator
+                    # (never the raw ref).
+                    sel = target.locator.get("value", "")
                     if tool == "click":
                         await STATE.browser.click(tab_id, sel)
                     elif tool == "type":
-                        await STATE.browser.type(tab_id, sel, action.get("text", ""))
+                        await STATE.browser.type(tab_id, sel,
+                                                 action.get("text", ""))
                     elif tool == "navigate":
-                        await STATE.browser.navigate(tab_id, action.get("url", ""))
-                    return {"ok": True, "command": tool, "args": action}
+                        await STATE.browser.navigate(tab_id,
+                                                     action.get("url", ""))
+                    else:
+                        raise RuntimeError(
+                            f"cdp_unsupported:{tool} without a connected "
+                            f"BrowserRuntime")
+                    return {"ok": True, "command": tool, "args": action,
+                            "via": "shim", "selector": sel}
 
                 future = asyncio.run_coroutine_threadsafe(execute(), STATE.loop)
-                return future.result(timeout=15)
+                return future.result(timeout=30)
             except Exception as e:
                 return {"ok": False, "error": f"CDP execution failed: {str(e)}"}
 
@@ -103,9 +172,12 @@ class ToolExecutor:
             actions, page_url=page_url, user_consented=user_consented,
             paused_for_user=self.paused_for_user)
 
-        # Phase 2: Direct CDP Bulk Execution (fail closed on unsupported tools)
+        # Stage D: CDP bulk execution, ref-safe like run().
         if self._use_cdp():
-            unsupported = [a for a in allowed if a.get("tool") not in ("click", "type", "navigate")]
+            supported = ("click", "type", "navigate", "select", "scroll",
+                         "press_key")
+            unsupported = [a for a in allowed
+                           if a.get("tool") not in supported]
             if unsupported:
                 return {"ok": False,
                         "error": f"cdp_unsupported:{[a.get('tool') for a in unsupported]}",
@@ -115,22 +187,42 @@ class ToolExecutor:
                 from .server import STATE
 
                 async def execute_bulk():
+                    runtime = getattr(STATE, "browser_runtime", None)
                     results = []
                     for a in allowed:
                         tool = a.get("tool")
-                        sel = a.get("selector") or a.get("ref")
-                        if tool == "click":
-                            await STATE.browser.click(tab_id, sel)
-                        elif tool == "type":
-                            await STATE.browser.type(tab_id, sel, a.get("text", ""))
-                        elif tool == "navigate":
-                            await STATE.browser.navigate(tab_id, a.get("url", ""))
-                        results.append({"tool": tool, "ok": True})
+                        target = _resolve_target(a, tab_id, page_url)
+                        if runtime is not None and runtime.connected:
+                            res = await asyncio.to_thread(
+                                _dispatch_runtime, runtime, tool, target,
+                                a, tab_id)
+                        else:
+                            sel = target.locator.get("value", "")
+                            if tool == "click":
+                                await STATE.browser.click(tab_id, sel)
+                            elif tool == "type":
+                                await STATE.browser.type(tab_id, sel,
+                                                         a.get("text", ""))
+                            elif tool == "navigate":
+                                await STATE.browser.navigate(
+                                    tab_id, a.get("url", ""))
+                            else:
+                                raise RuntimeError(
+                                    f"cdp_unsupported:{tool} without a "
+                                    f"connected BrowserRuntime")
+                            res = {"ok": True, "tool": tool, "via": "shim",
+                                   "selector": sel}
+                        results.append({"tool": tool, "ok": res.get("ok"),
+                                        "error": res.get("error")})
+                        if not res.get("ok"):
+                            break  # stop the batch on first failure
                     return results
 
                 future = asyncio.run_coroutine_threadsafe(execute_bulk(), STATE.loop)
-                executed_cmds = future.result(timeout=20)
-                return {"ok": True, "command": "bulk", "executed": executed_cmds,
+                executed_cmds = future.result(timeout=30)
+                ok_all = all(r.get("ok") for r in executed_cmds)
+                return {"ok": ok_all, "command": "bulk",
+                        "executed": executed_cmds,
                         "denied": denied, "savings_note": "CDP bulk execution"}
             except Exception as e:
                 return {"ok": False, "error": f"CDP bulk failed: {str(e)}"}

@@ -3,6 +3,15 @@
  * - Runs in isolated JS world; only executes pre-defined commands from harness.
  * - Reports human activity so the agent pauses (human priority).
  * - CSP-safe: no remote scripts, no eval; messaging via chrome.runtime only.
+ *
+ * Stage D: the interaction core below (window.__synk) is MIRRORED FROM
+ * harness/interactions.py INTERACTION_JS -- keep the two in sync. The
+ * EXECUTE handler now performs a ROBUST primitive (native value setter
+ * for React/Vue/Svelte inputs, contenteditable support, shadow-DOM
+ * piercing, frame targeting) and replies with a real BROWSER_ACK that
+ * carries the OBSERVED POST-STATE. executed=true is only ever sent
+ * together with that observation -- the harness never has to take the
+ * executor's word for it.
  */
 (() => {
   const HARNESS = "http://127.0.0.1:18080";
@@ -31,6 +40,223 @@
              window_id: WINDOW_ID || "win_default",
              frame_id: FRAME_ID };
   }
+
+  // ------------------------------------------------------------------
+  // Robust interaction core.
+  // MIRRORED FROM harness/interactions.py INTERACTION_JS -- keep in sync.
+  // ------------------------------------------------------------------
+  const __synk = (() => {
+    function byLocator(root, locator) {
+      const strategy = locator && locator.strategy;
+      const value = locator && locator.value;
+      if (!value) return [];
+      if (strategy === "test-id") {
+        return Array.prototype.slice.call(
+          root.querySelectorAll('[data-testid="' + value.replace(/"/g, '\\"') + '"]'));
+      }
+      if (strategy === "xpath") {
+        const out = [];
+        try {
+          const it = document.evaluate(value, root, null,
+            XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+          for (let i = 0; i < it.snapshotLength; i++) out.push(it.snapshotItem(i));
+        } catch (e) { /* invalid xpath -> no match (fail closed upstream) */ }
+        return out;
+      }
+      try { return Array.prototype.slice.call(root.querySelectorAll(value)); }
+      catch (e) { return []; }
+    }
+
+    function resolveTarget(spec) {
+      spec = spec || {};
+      let root = document;
+      const shadowPath = spec.shadowPath || spec.shadow_path || [];
+      for (let i = 0; i < shadowPath.length; i++) {
+        const host = root.querySelector(shadowPath[i]);
+        if (!host || !host.shadowRoot) {
+          return { ok: false, error: "shadow host not found: " + shadowPath[i] };
+        }
+        root = host.shadowRoot;
+      }
+      const locator = spec.locator || {};
+      if (locator.value) {
+        const els = byLocator(root, locator);
+        if (els.length === 0) return { ok: false, error: "no such element" };
+        if (els.length > 1) {
+          return { ok: false, error: "ambiguous locator: " + els.length + " matches",
+                   errorCode: "AMBIGUOUS_ELEMENT" };
+        }
+        return { ok: true, el: els[0] };
+      }
+      return { ok: false, error: "no locator in target" };
+    }
+
+    function isVisible(el) {
+      try {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 &&
+          window.getComputedStyle(el).visibility !== "hidden";
+      } catch (e) { return false; }
+    }
+
+    function observeTarget(el) {
+      let tag = "", type = "";
+      try { tag = (el.tagName || "").toLowerCase(); type = (el.type || "").toLowerCase(); } catch (e) {}
+      const st = { tag, type, visible: isVisible(el),
+                   disabled: !!el.disabled, url: location.href };
+      try {
+        if (tag === "input" || tag === "textarea") {
+          if (type === "checkbox" || type === "radio") st.checked = !!el.checked;
+          else if (type !== "password") st.value = el.value == null ? "" : String(el.value);
+          else st.value = ""; // passwords are never read back
+        } else if (tag === "select") {
+          const opt = el.selectedOptions && el.selectedOptions[0];
+          st.value = opt ? (opt.value != null ? opt.value : opt.text) : "";
+          st.selectedIndex = el.selectedIndex;
+        } else if (el.isContentEditable) {
+          st.value = (el.innerText || "").slice(0, 2000);
+        } else {
+          st.text = ((el.innerText || el.textContent || "").trim()).slice(0, 200);
+        }
+        st.focused = (document.activeElement === el);
+      } catch (e) { st.observeError = String((e && e.message) || e); }
+      return st;
+    }
+
+    function fire(el, Ctor, type, init) {
+      init = init || {};
+      init.bubbles = init.bubbles !== false;
+      init.cancelable = init.cancelable !== false;
+      init.composed = true;
+      let ev;
+      try { ev = new Ctor(type, init); }
+      catch (e) { ev = document.createEvent("Event"); ev.initEvent(type, true, true); }
+      return el.dispatchEvent(ev);
+    }
+
+    // Native value setter: the key to controlled React/Vue/Svelte inputs.
+    function nativeSetValue(el, value) {
+      let proto = null;
+      try {
+        const tag = (el.tagName || "").toLowerCase();
+        if (tag === "textarea") proto = window.HTMLTextAreaElement.prototype;
+        else proto = window.HTMLInputElement.prototype;
+        const desc = Object.getOwnPropertyDescriptor(proto, "value");
+        if (desc && desc.set) { desc.set.call(el, value); return true; }
+      } catch (e) { /* fall through */ }
+      el.value = value; // last resort: plain assignment
+      return false;
+    }
+
+    function robustType(el, text, opts) {
+      opts = opts || {};
+      const tag = (el.tagName || "").toLowerCase();
+      const type = (el.type || "").toLowerCase();
+      try { el.focus({ preventScroll: false }); } catch (e) { try { el.focus(); } catch (e2) {} }
+      if (el.isContentEditable) {
+        try {
+          el.focus();
+          const sel = window.getSelection();
+          sel.selectAllChildren(el);
+          const okIns = document.execCommand("insertText", false, text);
+          if (!okIns) {
+            el.textContent = text;
+            fire(el, Event, "input");
+          }
+          fire(el, Event, "change");
+          fire(el, FocusEvent, "blur");
+          return { ok: true, observed: observeTarget(el) };
+        } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+      }
+      if (tag === "input" && (type === "checkbox" || type === "radio")) {
+        return robustCheck(el, text);
+      }
+      if (tag !== "input" && tag !== "textarea") {
+        return { ok: false, error: "robustType needs input/textarea/contenteditable" };
+      }
+      try {
+        if (opts.clearFirst !== false) {
+          nativeSetValue(el, "");
+          fire(el, Event, "input");
+        }
+        nativeSetValue(el, text);
+        fire(el, Event, "input");
+        fire(el, Event, "change");
+        try { el.blur(); } catch (e) {}
+        fire(el, FocusEvent, "blur");
+        return { ok: true, observed: observeTarget(el) };
+      } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+    }
+
+    function robustCheck(el, want) {
+      try {
+        const target = (want === "toggle") ? !el.checked :
+                       (want === true || want === "true");
+        if (el.checked !== target) {
+          try { el.scrollIntoView({ block: "nearest" }); } catch (e) {}
+          fire(el, PointerEvent, "pointerdown");
+          fire(el, MouseEvent, "mousedown");
+          fire(el, PointerEvent, "pointerup");
+          fire(el, MouseEvent, "mouseup");
+          fire(el, MouseEvent, "click");
+          el.checked = target; // ensure end state even if handlers swallowed it
+          fire(el, Event, "input");
+          fire(el, Event, "change");
+        }
+        try { el.blur(); } catch (e) {}
+        return { ok: true, observed: observeTarget(el) };
+      } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+    }
+
+    function robustClick(el) {
+      try { el.scrollIntoView({ block: "center", behavior: "instant" }); } catch (e) {
+        try { el.scrollIntoView({ block: "center" }); } catch (e2) {}
+      }
+      try { el.focus({ preventScroll: true }); } catch (e) {}
+      const before = location.href;
+      fire(el, PointerEvent, "pointerdown");
+      fire(el, MouseEvent, "mousedown");
+      fire(el, PointerEvent, "pointerup");
+      fire(el, MouseEvent, "mouseup");
+      fire(el, MouseEvent, "click");
+      const st = observeTarget(el);
+      st.navigated = (location.href !== before);
+      return { ok: true, observed: st };
+    }
+
+    function robustSelect(el, value) {
+      const tag = (el.tagName || "").toLowerCase();
+      if (tag !== "select") return { ok: false, error: "robustSelect needs <select>" };
+      try {
+        let idx = -1;
+        for (let i = 0; i < el.options.length; i++) {
+          const o = el.options[i];
+          if (o.value === value || (o.text || "").trim() === (value || "").trim()) { idx = i; break; }
+        }
+        if (idx < 0) return { ok: false, error: "option not found: " + value };
+        el.selectedIndex = idx;
+        fire(el, Event, "input");
+        fire(el, Event, "change");
+        try { el.blur(); } catch (e) {}
+        return { ok: true, observed: observeTarget(el) };
+      } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+    }
+
+    function pressKey(el, key) {
+      const tgt = el || document.activeElement || document.body;
+      const init = { key, code: key.length === 1 ? "Key" + key.toUpperCase() : key,
+                     bubbles: true, cancelable: true, composed: true };
+      try {
+        fire(tgt, KeyboardEvent, "keydown", init);
+        if (key.length === 1) fire(tgt, KeyboardEvent, "keypress", init);
+        fire(tgt, KeyboardEvent, "keyup", init);
+        return { ok: true, observed: observeTarget(tgt) };
+      } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+    }
+
+    return { resolveTarget, observeTarget, robustType, robustCheck,
+             robustClick, robustSelect, pressKey };
+  })();
 
   // Beta: fire-and-forget typed events -> harness Event Bus / WorldState.
   function sendEvent(type, data) {
@@ -161,53 +387,97 @@
     } catch { return false; }
   }
 
-  function doCommand(cmd, args = {}) {
-    // Whitelisted DOM ops only (spec 5: never execute arbitrary code).
-    switch (cmd) {
-      case "click": {
-        const el = document.querySelector(args.selector || "");
-        if (!el) return { ok: false, error: "no such element" };
-        highlight(args.selector);
-        el.click();
-        return { ok: true };
-      }
-      case "type": {
-        const el = document.querySelector(args.selector || "");
-        if (!el) return { ok: false, error: "no such element" };
-        highlight(args.selector);
-        el.focus();
-        el.value = args.text ?? "";
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-        return { ok: true };
-      }
-      case "select": {
-        const el = document.querySelector(args.selector || "");
-        if (!el) return { ok: false, error: "no such element" };
-        el.value = args.value ?? "";
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-        return { ok: true };
-      }
-      case "scroll":
-        window.scrollBy(0, args.direction === "up" ? -600 : 600);
-        return { ok: true };
-      case "press_key":
-        document.activeElement?.dispatchEvent(
-          new KeyboardEvent("keydown", { key: args.key || "Enter", bubbles: true }));
-        return { ok: true };
-      case "focus": {
-        const el = document.querySelector(args.selector || "");
-        el?.focus();
-        return { ok: !!el };
-      }
-      case "hover": {
-        const el = document.querySelector(args.selector || "");
-        el?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-        return { ok: !!el };
-      }
-      default:
-        return { ok: false, error: `content: unsupported '${cmd}'` };
+  // Stage D: honest command execution. Returns a BROWSER_ACK dict.
+  // executed=true is ONLY set together with the observed post-state,
+  // captured AFTER the DOM operation ran. Failures carry typed
+  // error_codes the harness maps into its error taxonomy.
+  function doCommand(command, target, args = {}, action_id = null) {
+    const ack = {
+      ack: true,
+      ack_id: "ack_" + Math.random().toString(16).slice(2, 10),
+      action_id: action_id || null,
+      command,
+      accepted: true,      // validated + whitelisted command
+      executed: false,     // flips only with an observation below
+      observed: null,
+      error: null,
+      error_code: null,
+      ...identity(),
+    };
+    const fail = (error, error_code) => ({ ...ack, error, error_code });
+
+    // Frame targeting: this content-script instance only acts when the
+    // message names its own frame. Sibling frames stay silent so exactly
+    // one frame replies (broadcast EXECUTE, single responder).
+    const wantFrame = (target && target.frame_id) || "main";
+    if (wantFrame !== FRAME_ID) return null; // not our frame: no reply
+
+    const spec = {
+      frameId: FRAME_ID,
+      shadowPath: (target && target.shadow_path) || [],
+      locator: (target && target.locator) || {},
+    };
+    // Backwards compat: older harness messages carry only args.selector.
+    if (!spec.locator.value && args.selector) {
+      spec.locator = { strategy: "css", value: args.selector };
     }
+    const found = __synk.resolveTarget(spec);
+    if (!found.ok) {
+      return fail(found.error,
+        found.errorCode === "AMBIGUOUS_ELEMENT" ? "AMBIGUOUS_ELEMENT"
+                                                : "STALE_REFERENCE");
+    }
+    const el = found.el;
+    try { highlight(spec.locator.value); } catch (e) {}
+
+    let res;
+    try {
+      switch (command) {
+        case "click":
+          res = __synk.robustClick(el);
+          break;
+        case "type":
+          res = __synk.robustType(el, args.text ?? "",
+                                  { clearFirst: args.clear_first !== false });
+          break;
+        case "select":
+          res = __synk.robustSelect(el, args.value ?? "");
+          break;
+        case "press_key":
+          res = __synk.pressKey(el, args.key || "Enter");
+          break;
+        case "scroll":
+          window.scrollBy(0, args.direction === "up" ? -600 : 600);
+          res = { ok: true, observed: { scrolled: true, url: location.href } };
+          break;
+        case "focus":
+          el.focus();
+          res = { ok: true, observed: __synk.observeTarget(el) };
+          break;
+        case "hover":
+          el.dispatchEvent(new MouseEvent("mouseover",
+            { bubbles: true, composed: true }));
+          res = { ok: true, observed: __synk.observeTarget(el) };
+          break;
+        default:
+          return fail(`content: unsupported '${command}'`, "TOOL_NOT_FOUND");
+      }
+    } catch (e) {
+      return fail(String((e && e.message) || e), "ACTION_FAILED");
+    }
+    if (!res.ok) return fail(res.error || "primitive failed", "ACTION_FAILED");
+
+    // The DOM operation ran; capture the post-state NOW. This is the
+    // evidence the verifier will judge -- not our word that it ran.
+    ack.executed = true;
+    ack.observed = {
+      observation_id: "obs_" + Date.now().toString(36) +
+                      Math.random().toString(16).slice(2, 8),
+      url: location.href,
+      target_state: res.observed || {},
+      captured_at: Date.now(),
+    };
+    return ack;
   }
 
   // Human-activity detection -> ownership events (Beta); the pause flag
@@ -263,12 +533,15 @@
 
   chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     if (msg.type === "CAPTURE") {
-      reply({ url: location.href, nodes: captureNodes() });
+      reply({ url: location.href, nodes: captureNodes(), ...identity() });
       pushSnapshot(msg.goal || "");
       return true;
     }
     if (msg.type === "EXECUTE") {
-      const res = doCommand(msg.command, msg.args || {});
+      // Single-responder broadcast: only the target frame replies.
+      const res = doCommand(msg.command, msg.target || {},
+                            msg.args || {}, msg.action_id || null);
+      if (res === null) return false; // not our frame: stay silent
       pushSnapshot();
       reply(res);
       return true;

@@ -47,7 +47,7 @@ def stable_id(prefix: str, *parts: str) -> str:
 
 
 def canonical_origin(url: str) -> str:
-    """scheme://host[:port] — the security identity, not just a hostname."""
+    """scheme://host[:port] - the security identity, not just a hostname."""
     try:
         scheme, rest = url.split("://", 1)
         hostport = rest.split("/", 1)[0].lower()
@@ -57,20 +57,57 @@ def canonical_origin(url: str) -> str:
 
 
 class Frame:
-    """A single document frame inside a tab."""
+    """A single document frame inside a tab.
 
-    def __init__(self, frame_id: str, url: str = ""):
+    Stage D: frames carry their position in the frame tree
+    (parent_frame_id + frame_chain from the main frame) and, when the
+    runtime knows it, the browser's own frame id (Chrome's numeric
+    sender.frameId / CDP frameId). Document identity is stable while the
+    frame's document lives; navigation (or a frame tree rebuild) replaces
+    it. Element refs pinned against a document_id fail closed once the
+    document is replaced.
+    """
+
+    def __init__(self, frame_id: str, url: str = "",
+                 parent_frame_id: str | None = None,
+                 frame_chain: list | None = None,
+                 name: str = "",
+                 chromium_frame_id: int | None = None):
         self.frame_id = frame_id
         self.url = url
         self.origin = canonical_origin(url)
+        self.parent_frame_id = parent_frame_id
+        if frame_chain is not None:
+            self.frame_chain = list(frame_chain)
+        elif parent_frame_id is None:
+            self.frame_chain = [frame_id]
+        else:
+            self.frame_chain = [MAIN_FRAME, frame_id]
+        self.name = name
+        self.chromium_frame_id = chromium_frame_id
         self.document_id = stable_id("doc", frame_id, self.origin)
         self.observation_version = 0      # monotonic int, per frame
         self.observation_id: str | None = None
         self.snapshot_hash: str | None = None
 
+    def replace_document(self, url: str = "") -> None:
+        """Navigation / frame rebuild: new document identity, fresh version."""
+        if url:
+            self.url = url
+            self.origin = canonical_origin(url)
+        self.document_id = stable_id("doc", self.frame_id, self.origin,
+                                     str(time.time_ns()))
+        self.observation_version = 0
+        self.observation_id = None
+        self.snapshot_hash = None
+
     def to_dict(self) -> dict:
         return {"frame_id": self.frame_id, "url": self.url,
                 "origin": self.origin, "document_id": self.document_id,
+                "parent_frame_id": self.parent_frame_id,
+                "frame_chain": self.frame_chain,
+                "name": self.name,
+                "chromium_frame_id": self.chromium_frame_id,
                 "observation_version": self.observation_version,
                 "observation_id": self.observation_id,
                 "snapshot_hash": self.snapshot_hash}
@@ -90,23 +127,42 @@ class Tab:
         self.opened_at = time.time()
         self.last_observation_id: str | None = None
 
-    def frame(self, frame_id: str = MAIN_FRAME) -> Frame:
+    def frame(self, frame_id: str = MAIN_FRAME,
+              parent_frame_id: str | None = None,
+              frame_chain: list | None = None,
+              name: str = "",
+              chromium_frame_id: int | None = None) -> Frame:
         f = self.frames.get(frame_id)
         if f is None:
-            f = Frame(frame_id, self.url)
+            f = Frame(frame_id, self.url,
+                      parent_frame_id=parent_frame_id,
+                      frame_chain=frame_chain, name=name,
+                      chromium_frame_id=chromium_frame_id)
             self.frames[frame_id] = f
+        else:
+            # Preserve document identity across snapshot events: an existing
+            # frame keeps its document_id. Only explicit metadata updates.
+            if name:
+                f.name = name
+            if chromium_frame_id is not None:
+                f.chromium_frame_id = chromium_frame_id
+            if parent_frame_id is not None:
+                f.parent_frame_id = parent_frame_id
+            if frame_chain is not None:
+                f.frame_chain = list(frame_chain)
         return f
 
     def navigate(self, url: str, title: str = "") -> None:
-        """Navigation replaces the main-frame document: new document identity."""
+        """Navigation replaces the main-frame document (new document
+        identity) and rebuilds the frame tree: subframe documents are
+        replaced too, since their documents die with the navigation."""
         self.url = url
         self.title = title or self.title
         self.origin = canonical_origin(url)
-        main = self.frames[MAIN_FRAME]
-        main.url = url
-        main.origin = self.origin
-        main.document_id = stable_id("doc", self.tab_id, MAIN_FRAME, url,
-                                     str(time.time_ns()))
+        self.frames[MAIN_FRAME].replace_document(url)
+        for fid, f in self.frames.items():
+            if fid != MAIN_FRAME:
+                f.replace_document()
 
     def identity(self, session_id: str) -> dict:
         return {"session_id": session_id, "window_id": self.window_id,
@@ -203,11 +259,19 @@ class SessionManager:
 
     def register_frame(self, tab_id: str, frame_id: str,
                        window_id: str = "win_default",
-                       session_id: str | None = None, url: str = "") -> Frame:
+                       session_id: str | None = None, url: str = "",
+                       parent_frame_id: str | None = None,
+                       frame_chain: list | None = None,
+                       name: str = "",
+                       chromium_frame_id: int | None = None) -> Frame:
         with self._lock:
             tab = self.register_tab(tab_id, window_id, session_id, url=url)
-            frame = tab.frame(frame_id)
+            frame = tab.frame(frame_id, parent_frame_id=parent_frame_id,
+                              frame_chain=frame_chain, name=name,
+                              chromium_frame_id=chromium_frame_id)
             if url:
+                # Snapshot from the same document: URL updates, identity
+                # stays. (A real navigation goes through tab.navigate().)
                 frame.url = url
                 frame.origin = canonical_origin(url)
             return frame
@@ -247,6 +311,19 @@ class SessionManager:
             return tab
 
     # -- reads -------------------------------------------------------------
+    def tab_url(self, tab_id: str,
+                session_id: str | None = None) -> str | None:
+        """Current URL of a tab, or None if not registered."""
+        with self._lock:
+            for sid, sess in self.sessions.items():
+                if session_id and sid != session_id:
+                    continue
+                for win in sess.windows.values():
+                    tab = win.tabs.get(tab_id)
+                    if tab is not None:
+                        return tab.url
+            return None
+
     def tab_identity(self, tab_id: str,
                      session_id: str | None = None) -> dict | None:
         """Resolve a tab_id to its full canonical identity, or None."""

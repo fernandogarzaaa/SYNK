@@ -1,165 +1,102 @@
-"""CDP Browser Controller: optional direct browser control (Phase 2).
-Implements the 'Runtime' side of the Truth Layer.
-Requires playwright; fails closed when unavailable so extension mode still works.
+"""CDP Browser Controller: backwards-compatible shim (Stage D).
+
+The old controller launched a Chromium with ``--remote-debugging-port``
+while the surrounding docs implied "attach to the user's browser" --
+that claim was never true. This module now delegates to
+``OwnedBrowserRuntime.launch()``: a SYNK-managed Chromium with a
+persistent SYNK-owned profile. Same class name and method signatures so
+``harness.server`` keeps working; new code should use the
+``BrowserRuntime`` interface (``harness/browser_runtime.py``) directly.
+
+Playwright remains optional: without it the controller reports
+``available == False`` and the server runs in extension mode.
 """
 from __future__ import annotations
-from typing import Optional, Dict, Any
 
-try:
-    from playwright.async_api import async_playwright, Browser, Page, BrowserContext
-    _PLAYWRIGHT_AVAILABLE = True
-except ImportError:  # keep extension mode working without playwright
-    async_playwright = None  # type: ignore
-    Browser = object  # type: ignore
-    Page = object  # type: ignore
-    BrowserContext = object  # type: ignore
-    _PLAYWRIGHT_AVAILABLE = False
+import asyncio
+from typing import Any, Dict, Optional
+
+from .browser_owned import OwnedBrowserRuntime
+from .browser_runtime import ElementTarget
+from .session import MAIN_FRAME
+
+
+def _playwright_available() -> bool:
+    try:
+        import playwright.async_api  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 class BrowserController:
-    def __init__(self, headless: bool = False):
+    """Async-compat wrapper around OwnedBrowserRuntime (launch mode)."""
+
+    def __init__(self, headless: bool = False, profile_dir: str | None = None):
         self.headless = headless
+        self._rt = OwnedBrowserRuntime.launch(profile_dir=profile_dir,
+                                              headless=headless)
+        # Compat attributes read by older call sites.
         self.playwright = None
         self.browser = None
         self.context = None
         self.pages: Dict[str, Any] = {}
-        self.available = _PLAYWRIGHT_AVAILABLE
+
+    @property
+    def available(self) -> bool:
+        return _playwright_available()
+
+    @property
+    def runtime(self) -> OwnedBrowserRuntime:
+        """The underlying BrowserRuntime (connected after start())."""
+        return self._rt
 
     async def start(self):
-        """Launches the browser and creates a shared context."""
+        """Connect the SYNK-owned browser (own loop thread; this coroutine
+        only bridges)."""
         if not self.available:
-            print("BrowserController unavailable: playwright not installed (extension mode).")
+            print("BrowserController unavailable: playwright not installed "
+                  "(extension mode).")
             return
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(
-            headless=self.headless,
-            args=["--remote-debugging-port=9222"]
-        )
-        self.context = await self.browser.new_context()
-        print("Browser started via CDP.")
+        await asyncio.to_thread(self._rt.connect)
+        print("Browser started: SYNK-owned Chromium (persistent SYNK "
+              "profile), NOT the user's browser.")
 
-    async def _require_page(self, tab_id: str = "default"):
-        if not self.available or self.context is None:
-            raise RuntimeError("CDP browser unavailable (playwright missing or not started)")
-        if tab_id in self.pages:
-            return self.pages[tab_id]
-        page = await self.context.new_page()
-        self.pages[tab_id] = page
-        return page
+    def _target(self, tab_id: str, selector: str) -> ElementTarget:
+        return ElementTarget(session_id=None, window_id="win_default",
+                             tab_id=tab_id, frame_id=MAIN_FRAME,
+                             frame_chain=[MAIN_FRAME], shadow_path=[],
+                             locator={"strategy": "css", "value": selector})
 
-    async def get_page(self, tab_id: str = "default"):
-        return await self._require_page(tab_id)
+    async def _require_ack(self, ack, what: str):
+        if not ack.executed:
+            raise RuntimeError(f"CDP {what} failed: {ack.error}")
+        return ack
 
     async def navigate(self, tab_id: str, url: str):
-        page = await self._require_page(tab_id)
-        await page.goto(url)
-        return page.url
+        ack = await asyncio.to_thread(self._rt.navigate, url, tab_id=tab_id)
+        await self._require_ack(ack, "navigate")
+        return ack.observed.url if ack.observed else url
 
     async def click(self, tab_id: str, selector: str):
-        page = await self._require_page(tab_id)
-        await page.click(selector)
+        ack = await asyncio.to_thread(self._rt.click,
+                                      self._target(tab_id, selector))
+        await self._require_ack(ack, "click")
 
     async def type(self, tab_id: str, selector: str, text: str):
-        page = await self._require_page(tab_id)
-        await page.fill(selector, text)
+        ack = await asyncio.to_thread(self._rt.type,
+                                      self._target(tab_id, selector), text)
+        await self._require_ack(ack, "type")
 
-    async def snapshot(self, tab_id: str) -> Dict[str, Any]:
-        """Extracts structured DOM matching extension/content.js shape.
+    async def get_page(self, tab_id: str = "default"):
+        return await asyncio.to_thread(self._rt._page_for, tab_id)
 
-        Returns {url, title, nodes: [{role,name,tag,selector,interactive,
-        visible,disabled,checked,selected,value,href,frame_id}]}.
-        """
-        page = await self._require_page(tab_id)
-        nodes = await page.evaluate("""() => {
-            const selector = (el) => {
-                if (el.id) return '#' + el.id;
-                const parts = [];
-                let cur = el;
-                for (let i = 0; i < 4 && cur && cur !== document.body; i++) {
-                    let s = cur.tagName.toLowerCase();
-                    const c = (typeof cur.className === 'string' ? cur.className.trim().split(/\\s+/)[0] : '');
-                    if (c) s += '.' + c;
-                    parts.unshift(s);
-                    cur = cur.parentElement;
-                }
-                return parts.join(' > ');
-            };
-            const roleOf = (el) => {
-                const explicit = el.getAttribute && el.getAttribute('role');
-                if (explicit) return explicit;
-                const tag = el.tagName.toLowerCase();
-                if (tag === 'button') return 'button';
-                if (tag === 'a') return 'link';
-                if (tag === 'input') {
-                    const t = (el.type || 'text').toLowerCase();
-                    if (t === 'checkbox') return 'checkbox';
-                    if (t === 'radio') return 'radio';
-                    if (t === 'password') return 'passwordbox';
-                    return 'textbox';
-                }
-                if (tag === 'textarea') return 'textbox';
-                if (tag === 'select') return 'combobox';
-                if (tag === 'form') return 'form';
-                if (/^h[1-6]$/.test(tag)) return 'heading';
-                if (tag === 'img') return 'image';
-                return tag;
-            };
-            const nameOf = (el) => {
-                return (
-                    (el.getAttribute && el.getAttribute('aria-label')) ||
-                    (el.innerText ? el.innerText.trim().slice(0, 80) : '') ||
-                    el.value || el.placeholder || el.title || el.name || ''
-                ).toString().trim().slice(0, 120);
-            };
-            const els = document.querySelectorAll(
-                'a,button,input,select,textarea,form,[role],[aria-label],h1,h2,h3'
-            );
-            const out = [];
-            els.forEach((el) => {
-                const r = el.getBoundingClientRect();
-                const tag = el.tagName.toLowerCase();
-                const node = {
-                    role: roleOf(el),
-                    name: nameOf(el),
-                    tag,
-                    selector: selector(el),
-                    interactive: ['a','button','input','select','textarea'].includes(tag),
-                    visible: !(r.width === 0 && r.height === 0),
-                    disabled: !!el.disabled,
-                    href: tag === 'a' ? (el.getAttribute('href') || '') : '',
-                    frame_id: 'main',
-                };
-                if (tag === 'input' || tag === 'textarea') {
-                    const t = (el.type || 'text').toLowerCase();
-                    if (t === 'checkbox' || t === 'radio') node.checked = !!el.checked;
-                    else if (t !== 'password') node.value = el.value ?? '';
-                    else node.value = '';
-                    node.selected = !!el.selected;
-                }
-                if (tag === 'select') {
-                    const opt = el.selectedOptions && el.selectedOptions[0];
-                    node.value = opt ? (opt.value ?? opt.text) : '';
-                    node.selected = el.selectedIndex >= 0;
-                }
-                if (tag === 'option') node.selected = !!el.selected;
-                out.push(node);
-                if (out.length >= 800) return;
-            });
-            return out;
-        }""")
-        return {
-            "url": page.url,
-            "title": await page.title(),
-            "nodes": nodes,
-        }
+    async def snapshot(self, tab_id: str = "default") -> Dict[str, Any]:
+        """Structured DOM in extension/content.js shape."""
+        return await asyncio.to_thread(self._rt.snapshot, tab_id)
 
     async def screenshot(self, tab_id: str = "default") -> bytes:
-        """Capture a PNG screenshot of the tab (L3 selective vision)."""
-        page = await self._require_page(tab_id)
-        return await page.screenshot(type="png")
+        return await asyncio.to_thread(self._rt.screenshot, tab_id=tab_id)
 
     async def stop(self):
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
+        await asyncio.to_thread(self._rt.disconnect)
