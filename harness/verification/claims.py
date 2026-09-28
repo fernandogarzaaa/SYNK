@@ -24,6 +24,12 @@ class Claim:
     timestamp: float = field(default_factory=time.time)
     action_ids: List[str] = field(default_factory=list)
     status: str = "proposed" # proposed | verified | failed | unverified | conflicting
+    # Stage C: the tool that produced this claim and its declared
+    # postcondition, e.g. {"kind": "element_value", "target": "#email",
+    # "value": "a@b.c"}. When set, the verifier only accepts evidence
+    # appropriate to the postcondition kind (see evidence.satisfies_...).
+    tool: str = ""
+    postcondition: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -37,4 +43,6 @@ class Claim:
             "timestamp": self.timestamp,
             "action_ids": self.action_ids,
             "status": self.status,
+            "tool": self.tool,
+            "postcondition": self.postcondition,
         }

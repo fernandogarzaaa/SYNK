@@ -25,6 +25,63 @@ BROWSER_EVENT = "BROWSER_EVENT"
 HUMAN_EVENT = "HUMAN_EVENT"
 AGENT_EVENT = "AGENT_EVENT"
 
+# Evidence strength hierarchy (Stage C / mandate Phase 12).
+#
+# A claim is VERIFIED only from evidence *appropriate to its declared
+# postcondition*. Strength is provenance-weighted: "the executor accepted
+# the command" (BROWSER_EVENT / COMMAND_ACCEPTED tier) is the weakest
+# tier and can NEVER satisfy a postcondition on its own. A bare screenshot
+# is likewise insufficient unless a dedicated vision verifier explicitly
+# established the postcondition (payload["vision_verified"] is True).
+EVIDENCE_STRENGTH = {
+    BROWSER_EVENT: 0.10,            # COMMAND_ACCEPTED: dispatch only
+    AGENT_EVENT: 0.15,              # agent-internal note
+    SCREENSHOT: 0.20,               # visual; needs vision verifier
+    DOM_CHANGE: 0.45,               # DOM_OBSERVATION
+    ELEMENT_STATE: 0.50,            # canonical state read
+    ACCESSIBILITY_CHANGE: 0.55,     # ACCESSIBILITY_OBSERVATION
+    URL_CHANGE: 0.60,
+    DIALOG: 0.60,
+    FORM_VALIDATION: 0.60,
+    NAVIGATION: 0.65,
+    NETWORK_REQUEST: 0.70,          # NETWORK_RESULT tier
+    NETWORK_RESPONSE: 0.72,
+    WEBMCP_RESULT: 0.78,            # tool result from the page itself
+    DOWNLOAD: 0.80,                 # download event + file metadata
+    APPLICATION_CONFIRMATION: 0.88,  # app-level confirmation (order id, etc.)
+    HUMAN_EVENT: 0.95,              # HUMAN_CONFIRMATION
+}
+
+# Postcondition kind -> evidence types that may satisfy it. Types absent
+# here (BROWSER_EVENT, AGENT_EVENT, bare SCREENSHOT) can never verify a
+# postcondition, no matter how many are recorded.
+POSTCONDITION_EVIDENCE = {
+    "element_value": {DOM_CHANGE, ACCESSIBILITY_CHANGE, ELEMENT_STATE,
+                      HUMAN_EVENT, APPLICATION_CONFIRMATION},
+    "element_interaction": {DOM_CHANGE, ACCESSIBILITY_CHANGE, ELEMENT_STATE,
+                            URL_CHANGE, NAVIGATION, APPLICATION_CONFIRMATION,
+                            HUMAN_EVENT, DIALOG},
+    "url": {URL_CHANGE, NAVIGATION, HUMAN_EVENT},
+}
+
+
+def strength_of(evidence_type: str, payload: dict | None = None) -> float:
+    """Strength of an evidence type; screenshots need a vision verifier."""
+    if evidence_type == SCREENSHOT:
+        if payload and payload.get("vision_verified") is True:
+            return 0.85
+        return EVIDENCE_STRENGTH[SCREENSHOT]
+    return EVIDENCE_STRENGTH.get(evidence_type, 0.0)
+
+
+def satisfies_postcondition(evidence_type: str, postcondition_kind: str,
+                            payload: dict | None = None) -> bool:
+    """True when this evidence type may verify this postcondition kind."""
+    if evidence_type == SCREENSHOT:
+        return bool(payload and payload.get("vision_verified") is True)
+    allowed = POSTCONDITION_EVIDENCE.get(postcondition_kind, set())
+    return evidence_type in allowed
+
 @dataclass(frozen=True)
 class Evidence:
     evidence_id: str

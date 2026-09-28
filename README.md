@@ -51,7 +51,7 @@ planner — the prototype works fully offline.
 | GET | `/health` | liveness + version |
 | POST | `/snapshot` | ingest page nodes → trimmed context + prompt (carries explicit `tab_id`/`window_id`/`frame_id`/`session_id`) |
 | POST | `/plan` | LLM action plan for goal (includes tier, execution level) |
-| POST | `/act` | validate+queue actions (bulk supported) |
+| POST | `/act` | canonical execution via ExecutionGateway: honest per-action lifecycle (REQUEST → VALIDATED → LEASED → PRECONDITION_CHECK → DISPATCHED → ACKNOWLEDGED → OBSERVING → VERIFIED), per-action claims, aggregate `transaction_status` |
 | POST | `/human` | `{active}` human-priority pause flag |
 | GET | `/memory` | summary/prefs/recent |
 | POST | `/memory/pref`, `/memory/forget` | learn / GDPR forget |
@@ -64,7 +64,7 @@ planner — the prototype works fully offline.
 | GET | `/world` | WorldState snapshot + ownership + recent events |
 | POST | `/lease` | `{target,intent,ttl,tab_id}` → EXCLUSIVE short-lived agent lease (or 409); release is compare-and-release `{target, release: lease_id}` |
 | POST | `/estop` | `{active}` global emergency stop: revokes all agent leases, blocks new ones (separate from resource ownership) |
-| POST | `/transact` | transactional co-execution (lease+validate+execute+verify) |
+| POST | `/transact` | transactional co-execution via ExecutionGateway: bulk actions expand to one lifecycle + claim per sub-action; returns `transaction_status` (COMMITTED / PARTIALLY_COMMITTED / FAILED / UNVERIFIED) |
 | POST | `/compile` | `{intent,slots}` → Browser IR + lowered tool actions |
 | GET | `/ladder` | execution ladder levels + registered site adapters |
 | POST | `/workflow/observe` | `{steps,intent}` → mine candidates / confirm workflows |
@@ -78,6 +78,15 @@ planner — the prototype works fully offline.
 | POST | `/webmcp/discover` | `{origin|url}` → discover site's WebMCP tools |
 | POST | `/webmcp/capabilities` | `{origin?,goal?}` → list capabilities with risk/latency |
 | POST | `/webmcp/execute` | `{origin,tool,args,goal?,user_consented?}` → policy-gated execution |
+
+## Stage C endpoints (new): closed-loop agent
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | `/agent/begin` | `{goal, identity, max_steps}` → mint `task_id`, pin tab identity |
+| POST | `/agent/next` | OBSERVE → plan → VALIDATE → LEASE → returns `{"decision": "act", action, claim_id, lease_id}` or `success / continue / replan / request-human / abort` |
+| POST | `/agent/report` | `{task_id, action_id, claim_id, status}` → VERIFY against the post-action observation → DECIDE (lease released exactly once here) |
+| POST | `/agent/status` | task state: steps used/remaining, verified count, replans, history |
+| POST | `/agent/observe` | OBSERVE only: change flags (navigation, modal, human interference) without planning |
 
 ## Key advances
 
@@ -101,6 +110,21 @@ planner — the prototype works fully offline.
    - Even `deleteAccount()` from a site goes through the harness safety pipeline
 9. **Capability Registry** — unified view of all capabilities across sources (webmcp/dom/primitive/vision)
 10. **Benchmarks with Co-working Metrics** — interference rate, agent overlap rate, recovered conflict rate, agent tax
+
+### Stage C (✓): honest transactions + closed loop
+11. **ExecutionGateway** — the single `ExecutionGateway.execute(request)` used by `/act`, `/transact`, the extension, Tauri (via `/act`), and tests. HTTP endpoints are thin adapters; no caller bypasses the transaction / ownership / verification pipeline.
+12. **Honest transaction lifecycle** — every action moves through REQUEST → VALIDATED → LEASED → PRECONDITION_CHECK → DISPATCHED → ACKNOWLEDGED → OBSERVING → VERIFIED. "ACKNOWLEDGED" means the executor accepted the command, never that the browser performed it. Extension mode queues commands; only an independent post-execution observation can VERIFY a claim.
+13. **Per-action claims, batch expansion** — `bulk` actions expand so each sub-action gets its own lifecycle, exclusive lease, and claim through the single global Verifier. No vague batch claims.
+14. **Typed error taxonomy** — POLICY_DENIED, CONSENT_REQUIRED, OWNERSHIP_CONFLICT, STALE_REFERENCE, BROWSER_NOT_READY, ACTION_FAILED, TIMEOUT, NAVIGATION_CHANGED, VERIFICATION_FAILED, VERIFICATION_UNAVAILABLE, TOOL_NOT_FOUND, SCHEMA_INVALID. Callers decide (retry / replan / ask human / abort) from the code, not from string matching.
+15. **Aggregate transaction states** — COMMITTED / PARTIALLY_COMMITTED / FAILED / UNVERIFIED. ROLLED_BACK is reported only if compensating rollback handlers actually run; browser DOM mutations are not ACID, and this is documented as transactional orchestration with explicit partial-commit semantics.
+16. **Evidence strength + provenance hierarchy** — command-accepted evidence and bare screenshots can never verify a state postcondition; screenshots require explicit `vision_verified=True`. Unknown postcondition kinds and unknown named verification checks fail closed as UNVERIFIED.
+17. **Closed-loop agent** — `/agent/*` endpoints plus the extension's rewritten `runTask()`: observe → update world → select capability → plan → validate → lease → execute one mutation → observe → verify → decide (success | continue | replan | request-human | abort). Step budgets are task-scoped (`TaskExecutionContext`); tasks never share one budget. Refs are pinned to a snapshot version and fail closed on drift; leases release exactly once in `/agent/report`.
+18. **`page.loaded` dedup** — snapshots are journaled exactly once via the single bus-event ingest path.
+
+Honest limitations (not hidden):
+- WebMCP's `/webmcp/execute` still verifies through its own private `_verify_result()` path; unifying it with the gateway is Stage E work.
+- In extension mode the gateway's synchronous path reports UNVERIFIED until the closed loop's post-action observation arrives; the extension `EXECUTE` content-script handler must report the browser's actual result (ok / error) for verification to mean anything.
+- The mock planner and local model stubs remain deterministic heuristics for offline use; they are labeled as such in responses (`+mock-offline`).
 
 ## Safety (Alpha + Beta + Beta.1 §21)
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import time
 from typing import Any, Optional, List, Dict, Tuple
 
-from .evidence import Evidence, DOM_CHANGE, NAVIGATION, URL_CHANGE, WEBMCP_RESULT, BROWSER_EVENT
+from .evidence import (Evidence, DOM_CHANGE, NAVIGATION, URL_CHANGE,
+                         WEBMCP_RESULT, BROWSER_EVENT,
+                         satisfies_postcondition, strength_of)
 from .claims import Claim
 from .results import VerificationResult, VERIFIED, FAILED, UNVERIFIED, CONFLICTING
 
@@ -84,7 +86,16 @@ class Verifier:
                     return VerificationResult(CONFLICTING, [dom_ev[-1].evidence_id],
                                               reason=f"DOM state {actual!r} contradicts claim {claimed!r}")
 
-        # 4. Final decision: require a positive signal, never auto-verify on presence alone
+        # 4. Stage C: postcondition-appropriate evidence. When the claim
+        # declares a postcondition, ONLY evidence types appropriate to that
+        # postcondition kind may verify it. BROWSER_EVENT ("the executor
+        # accepted the command"), bare screenshots, and unrelated evidence
+        # can never satisfy a postcondition -- this is the central
+        # invariant: VERIFIED requires independent observation.
+        if claim.postcondition:
+            return self._verify_postcondition(claim, relevant_evidence)
+
+        # 5. Final decision: require a positive signal, never auto-verify on presence alone
         if webmcp_ev and not url_ev and not dom_ev:
             # WebMCP ok=True with no contradiction is sufficient
             return VerificationResult(VERIFIED,
@@ -112,6 +123,90 @@ class Verifier:
                                       reason="Evidence present but does not match claimed_state")
 
         return VerificationResult(UNVERIFIED, reason="Insufficient evidence to verify")
+
+    # -- Stage C: postcondition-gated verification --------------------------------
+    def _verify_postcondition(self, claim: Claim,
+                              relevant: list) -> VerificationResult:
+        """Verify a claim against its declared postcondition.
+
+        Only evidence appropriate to the postcondition kind counts
+        (evidence.satisfies_postcondition). Unknown postcondition kinds fail
+        closed as UNVERIFIED.
+        """
+        pc = claim.postcondition or {}
+        kind = pc.get("kind")
+        if kind not in ("element_value", "element_interaction", "url"):
+            return VerificationResult(
+                UNVERIFIED,
+                reason=f"unknown postcondition kind {kind!r}; failing closed",
+                timestamp=time.time())
+        appropriate = [e for e in relevant
+                       if satisfies_postcondition(e.evidence_type, kind,
+                                                  e.payload)]
+        if not appropriate:
+            have = sorted({e.evidence_type for e in relevant})
+            return VerificationResult(
+                UNVERIFIED,
+                [e.evidence_id for e in relevant],
+                reason=("no postcondition-appropriate evidence for "
+                        f"{kind}; have only: {have or 'none'} "
+                        "(command-accepted evidence is never sufficient)"),
+                timestamp=time.time())
+        ids = [e.evidence_id for e in appropriate]
+
+        def _target_matches(e) -> bool:
+            want = pc.get("target")
+            got = (e.payload or {}).get("target")
+            return not want or not got or str(got) == str(want)
+
+        if kind == "url":
+            want = pc.get("url")
+            for e in appropriate:
+                if _target_matches(e) and e.payload.get("url") == want:
+                    return VerificationResult(
+                        VERIFIED, ids,
+                        reason=f"independent URL observation matches {want}",
+                        confidence=0.9, timestamp=time.time())
+            return VerificationResult(
+                UNVERIFIED, ids,
+                reason="URL observations do not match postcondition",
+                timestamp=time.time())
+
+        if kind == "element_value":
+            want = pc.get("value")
+            for e in appropriate:
+                if not _target_matches(e):
+                    continue
+                p = e.payload or {}
+                actual = p.get("value", p.get("state",
+                             p.get("text", p.get("detail"))))
+                if actual is not None and str(actual) == str(want):
+                    return VerificationResult(
+                        VERIFIED, ids,
+                        reason=(f"independent observation confirms "
+                                f"{pc.get('target')} == {want!r}"),
+                        confidence=0.9, timestamp=time.time())
+            return VerificationResult(
+                UNVERIFIED, ids,
+                reason=("appropriate evidence present but no observation "
+                        "confirms the expected value"),
+                timestamp=time.time())
+
+        # element_interaction: appropriate independent evidence (a DOM/state
+        # observation, navigation, or application/human confirmation tied to
+        # this claim) is sufficient.
+        matched = [e for e in appropriate if _target_matches(e)]
+        if matched:
+            kinds = sorted({e.evidence_type for e in matched})
+            return VerificationResult(
+                VERIFIED, [e.evidence_id for e in matched],
+                reason=f"independent observation confirms interaction "
+                       f"({', '.join(kinds)})",
+                confidence=0.85, timestamp=time.time())
+        return VerificationResult(
+            UNVERIFIED, ids,
+            reason="appropriate evidence present but not tied to the target",
+            timestamp=time.time())
 
     def get_evidence_for_task(self, task_id: str) -> List[Evidence]:
         return [e for e in self.evidence_store.values() if e.task_id == task_id]
