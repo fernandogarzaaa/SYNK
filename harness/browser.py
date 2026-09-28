@@ -66,7 +66,8 @@ class BrowserController:
     async def snapshot(self, tab_id: str) -> Dict[str, Any]:
         """Extracts structured DOM matching extension/content.js shape.
 
-        Returns {url, title, nodes: [{role,name,tag,selector,interactive}]}.
+        Returns {url, title, nodes: [{role,name,tag,selector,interactive,
+        visible,disabled,checked,selected,value,href,frame_id}]}.
         """
         page = await self._require_page(tab_id)
         nodes = await page.evaluate("""() => {
@@ -116,15 +117,32 @@ class BrowserController:
             const out = [];
             els.forEach((el) => {
                 const r = el.getBoundingClientRect();
-                if (r.width === 0 && r.height === 0) return;
                 const tag = el.tagName.toLowerCase();
-                out.push({
+                const node = {
                     role: roleOf(el),
                     name: nameOf(el),
                     tag,
                     selector: selector(el),
                     interactive: ['a','button','input','select','textarea'].includes(tag),
-                });
+                    visible: !(r.width === 0 && r.height === 0),
+                    disabled: !!el.disabled,
+                    href: tag === 'a' ? (el.getAttribute('href') || '') : '',
+                    frame_id: 'main',
+                };
+                if (tag === 'input' || tag === 'textarea') {
+                    const t = (el.type || 'text').toLowerCase();
+                    if (t === 'checkbox' || t === 'radio') node.checked = !!el.checked;
+                    else if (t !== 'password') node.value = el.value ?? '';
+                    else node.value = '';
+                    node.selected = !!el.selected;
+                }
+                if (tag === 'select') {
+                    const opt = el.selectedOptions && el.selectedOptions[0];
+                    node.value = opt ? (opt.value ?? opt.text) : '';
+                    node.selected = el.selectedIndex >= 0;
+                }
+                if (tag === 'option') node.selected = !!el.selected;
+                out.push(node);
                 if (out.length >= 800) return;
             });
             return out;

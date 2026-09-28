@@ -49,7 +49,7 @@ planner — the prototype works fully offline.
 | Method | Endpoint | Purpose |
 |---|---|---|
 | GET | `/health` | liveness + version |
-| POST | `/snapshot` | ingest page nodes → trimmed context + prompt |
+| POST | `/snapshot` | ingest page nodes → trimmed context + prompt (carries explicit `tab_id`/`window_id`/`frame_id`/`session_id`) |
 | POST | `/plan` | LLM action plan for goal (includes tier, execution level) |
 | POST | `/act` | validate+queue actions (bulk supported) |
 | POST | `/human` | `{active}` human-priority pause flag |
@@ -62,7 +62,8 @@ planner — the prototype works fully offline.
 |---|---|---|
 | POST | `/event` | push typed browser event (DOM, focus, human action…) |
 | GET | `/world` | WorldState snapshot + ownership + recent events |
-| POST | `/lease` | `{target,intent,ttl}` → short-lived agent lease (or 409) |
+| POST | `/lease` | `{target,intent,ttl,tab_id}` → EXCLUSIVE short-lived agent lease (or 409); release is compare-and-release `{target, release: lease_id}` |
+| POST | `/estop` | `{active}` global emergency stop: revokes all agent leases, blocks new ones (separate from resource ownership) |
 | POST | `/transact` | transactional co-execution (lease+validate+execute+verify) |
 | POST | `/compile` | `{intent,slots}` → Browser IR + lowered tool actions |
 | GET | `/ladder` | execution ladder levels + registered site adapters |

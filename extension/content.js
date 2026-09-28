@@ -8,13 +8,38 @@
   const HARNESS = "http://127.0.0.1:18080";
   let lastSent = 0;
 
+  // Explicit runtime identity: content scripts cannot read chrome.tabs, so
+  // the background relays our tab id once at load. Every event and snapshot
+  // we push carries (tab_id, frame_id); the harness never has to guess.
+  let TAB_ID = null, WINDOW_ID = null;
+  const FRAME_ID = (() => {
+    if (window === window.top) return "main";
+    let h = 0;
+    const s = location.href;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+    return "sub:" + (h >>> 0).toString(16);
+  })();
+  try {
+    chrome.runtime.sendMessage({ type: "GET_TAB_ID" }, (r) => {
+      if (r) { TAB_ID = r.tab_id != null ? String(r.tab_id) : null;
+               WINDOW_ID = r.window_id != null ? String(r.window_id) : null; }
+    });
+  } catch { /* background unreachable */ }
+
+  function identity() {
+    return { tab_id: TAB_ID || "default",
+             window_id: WINDOW_ID || "win_default",
+             frame_id: FRAME_ID };
+  }
+
   // Beta: fire-and-forget typed events -> harness Event Bus / WorldState.
   function sendEvent(type, data) {
     try {
       fetch(`${HARNESS}/event`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type, data: { url: location.href, ...(data || {}) } }),
+        body: JSON.stringify({ type,
+          data: { url: location.href, ...identity(), ...(data || {}) } }),
       }).catch(() => {});
     } catch { /* harness offline */ }
   }
@@ -75,15 +100,36 @@
     const nodes = [];
     els.forEach((el) => {
       const r = el.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) return; // skip hidden
       const tag = el.tagName.toLowerCase();
-      nodes.push({
+      const visible = !(r.width === 0 && r.height === 0);
+      const node = {
         role: roleOf(el),
         name: nameOf(el),
         tag,
         selector: selector(el),
         interactive: ["a", "button", "input", "select", "textarea"].includes(tag),
-      });
+        // Element state for fingerprinting / fail-closed ref validation.
+        // Values are page state, reported as data; never trusted as instructions.
+        visible,
+        disabled: !!el.disabled,
+        href: tag === "a" ? (el.getAttribute("href") || "") : "",
+        frame_id: FRAME_ID,
+      };
+      if (tag === "input" || tag === "textarea") {
+        const t = (el.type || "text").toLowerCase();
+        if (t === "checkbox" || t === "radio") node.checked = !!el.checked;
+        else if (t !== "password") node.value = el.value ?? "";
+        // password values are never captured
+        if (t === "password") node.value = "";
+        node.selected = !!el.selected;
+      }
+      if (tag === "select") {
+        const opt = el.selectedOptions && el.selectedOptions[0];
+        node.value = opt ? (opt.value ?? opt.text) : "";
+        node.selected = el.selectedIndex >= 0;
+      }
+      if (tag === "option") node.selected = !!el.selected;
+      nodes.push(node);
       if (nodes.length >= 800) return;
     });
     return nodes;
@@ -98,7 +144,7 @@
       await fetch(`${HARNESS}/snapshot`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: location.href, nodes, goal }),
+        body: JSON.stringify({ url: location.href, nodes, goal, ...identity() }),
       });
     } catch { /* harness offline: sidebar still works */ }
   }
@@ -191,8 +237,16 @@
   }, { passive: true, capture: true });
   document.addEventListener("input", (ev) => {
     try {
-      sendEvent("value.changed",
-        { target: selector(ev.target), detail: "value edited by human" });
+      const t = ev.target;
+      const isPassword = t && (t.type || "").toLowerCase() === "password";
+      const data = { target: selector(t), detail: "value edited by human" };
+      // Canonical state needs the new value; passwords are never reported.
+      if (!isPassword && t && "value" in t && typeof t.value === "string") {
+        data.value = t.value.slice(0, 500);
+      }
+      if (t && "checked" in t) data.checked = !!t.checked;
+      if (t && "disabled" in t) data.disabled = !!t.disabled;
+      sendEvent("value.changed", data);
     } catch {}
   }, { passive: true, capture: true });
   new MutationObserver((muts) => {

@@ -10,6 +10,7 @@ Run:  python server.py [--port 18080] [--db agent_memory.db]
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -21,6 +22,7 @@ from .concurrency import (CONFLICT, HUMAN_OWNED, LeaseManager,
                               OwnershipGraph, TransactionRunner)
 from .context_manager import ContextManager
 from .event_bus import EventBus
+from .session import SessionManager, new_id
 from .ladder import ExecutionLadder, LADDER
 from .memory import MemoryStore
 from .orchestrator import Orchestrator
@@ -109,6 +111,7 @@ class State:
         # Beta runtime: world + bus + ownership + transactions + learning
         self.bus = EventBus()
         self.world = WorldState()
+        self.sessions = SessionManager()
         self.ownership = OwnershipGraph()
         self.leases = LeaseManager(self.ownership)
         self.tx = TransactionRunner(self.world, self.ownership,
@@ -227,7 +230,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "chain_valid": STATE.safety.verify_chain()})
         if path == "/world":
             return self._send(200, {"world": STATE.world.snapshot(),
-                                    "ownership": STATE.ownership.snapshot(),
+                                    "ownership": STATE.ownership.detailed_snapshot(),
+                                    "sessions": STATE.sessions.snapshot(),
                                     "events": STATE.bus.recent(30)})
         if path == "/ladder":
             return self._send(200, {"levels": STATE.ladder.describe()})
@@ -256,6 +260,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "world_version": STATE.world.version})
         if path == "/lease":
             return self._lease(b)
+        if path == "/estop":
+            return self._estop(b)
         if path == "/compile":
             ir = compile_intent(b.get("intent", ""), b.get("slots", {}))
             return self._send(200, {"ir": ir, "actions": ir_to_actions(ir)})
@@ -379,6 +385,9 @@ class Handler(BaseHTTPRequestHandler):
     # -- handlers ------------------------------------------------------------------
     def _snapshot(self, b: dict):
         tab_id = b.get("tab_id", "default")
+        window_id = b.get("window_id", "win_default")
+        frame_id = b.get("frame_id", "main")
+        session_id = b.get("session_id")  # None -> default session
         title = b.get("title", "")
         if STATE.use_cdp:
             # Phase 2: CDP pull mode
@@ -390,21 +399,47 @@ class Handler(BaseHTTPRequestHandler):
             nodes = snap["nodes"]
             title = snap.get("title", "")
         else:
-            # Extension push mode (default): body carries url/nodes
+            # Extension push mode (default): body carries url/nodes.
+            # Tab identity comes from the extension (background.js pins the
+            # tab at task start); it is never inferred from "current tab".
             url = b.get("url", "")
             nodes = b.get("nodes", [])
+        # Canonical session registration: every snapshot carries explicit
+        # (session, window, tab, frame) identity.
+        sess = STATE.sessions.get_or_create_session(session_id)
+        STATE.sessions.register_tab(tab_id, window_id, sess.session_id,
+                                    url=url, title=title)
+        STATE.sessions.register_frame(tab_id, frame_id, window_id,
+                                      sess.session_id, url=url)
         for i, n in enumerate(nodes):
             n.setdefault("index", i)
+            n.setdefault("frame_id", frame_id)
         flat = json.dumps(nodes)[:20000]
         injected = STATE.safety.detect_injection(flat)
-        view = STATE.ctx.ingest(url, nodes, b.get("goal", ""), b.get("screenshot_note", ""))
-        STATE.world.load_full(url, view["nodes"], title, tab_id=tab_id)
-        STATE.bus.emit("page.loaded", {"url": url, "title": title, "tab_id": tab_id,
+        view = STATE.ctx.ingest(url, nodes, b.get("goal", ""),
+                                b.get("screenshot_note", ""),
+                                session_id=sess.session_id, tab_id=tab_id,
+                                frame_id=frame_id)
+        obs = STATE.sessions.record_observation(tab_id, frame_id,
+                                                snapshot_hash=view["hash"],
+                                                window_id=window_id,
+                                                session_id=sess.session_id)
+        STATE.world.load_full(url, view["nodes"], title, tab_id=tab_id,
+                              session_id=sess.session_id, window_id=window_id)
+        STATE.bus.emit("page.loaded", {"url": url, "title": title,
+                                       "tab_id": tab_id, "window_id": window_id,
+                                       "frame_id": frame_id,
+                                       "session_id": sess.session_id,
+                                       "observation_id": obs["observation_id"],
                                        "task_id": b.get("task_id"),
                                        "action_id": b.get("action_id")})
         view["injection_suspected"] = injected
         view["world_version"] = STATE.world.version
         view["world"] = STATE.world.prompt_section()
+        view["session_id"] = sess.session_id
+        view["window_id"] = window_id
+        view["frame_id"] = frame_id
+        view["observation_id"] = obs["observation_id"]
         view["prompt"] = STATE.ctx.build_prompt(b.get("goal", ""), STATE.mem.summary_for_prompt())
         view["prompt"] = STATE.safety.mask_pii(view["prompt"])
         if injected:
@@ -428,7 +463,9 @@ class Handler(BaseHTTPRequestHandler):
         if page_state is None:
             # WorldState uses tabs dict; fall back to active tab
             page_state = STATE.world.tabs.get(STATE.world.active_tab, {})
-        state_sig = f"v{STATE.world.version}:{hash(json.dumps(page_state, sort_keys=True, default=str))}"
+        state_sig = ("v%d:" % STATE.world.version) + hashlib.sha256(
+            json.dumps(page_state, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
         decision, routing_type = STATE.local_runtime.decide(
             site=domain, state_sig=state_sig, intent=goal,
             workflow_id=prep.get("workflow_id")
@@ -471,11 +508,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _act(self, b: dict):
         tab_id = b.get("tab_id", "default")
+        session_id = b.get("session_id")
         page_url = b.get("page_url", "")
         consented = bool(b.get("user_consented", False))
-        task_id = b.get("task_id") or f"t_{uuid.uuid4().hex[:8]}"
-        claim_id = b.get("claim_id") or f"c_{uuid.uuid4().hex[:8]}"
+        task_id = b.get("task_id") or new_id("t")
+        claim_id = b.get("claim_id") or new_id("c")
         actions = b.get("actions") or ([b["action"]] if "action" in b else [])
+        # Identity is captured on the action; execution targets the tab the
+        # task started on, never the browser's "current tab".
+        for a in actions:
+            a.setdefault("tab_id", tab_id)
+            if session_id:
+                a.setdefault("session_id", session_id)
+            a.setdefault("task_id", task_id)
         action_ids = [f"{claim_id}:{i}" for i in range(len(actions))]
         results = [STATE.tools.run(a, page_url, consented, tab_id=tab_id) for a in actions]
         now = time.time()
@@ -530,11 +575,17 @@ class Handler(BaseHTTPRequestHandler):
     def _transact(self, b: dict):
         """Transactional co-execution: lease -> validate -> execute -> verify."""
         tab_id = b.get("tab_id", "default")
+        session_id = b.get("session_id")
         page_url = b.get("page_url", "")
         consented = bool(b.get("user_consented", False))
-        task_id = b.get("task_id") or f"t_{uuid.uuid4().hex[:8]}"
-        claim_id = b.get("claim_id") or f"c_{uuid.uuid4().hex[:8]}"
+        task_id = b.get("task_id") or new_id("t")
+        claim_id = b.get("claim_id") or new_id("c")
         actions = b.get("actions") or ([b["action"]] if "action" in b else [])
+        for a in actions:
+            a.setdefault("tab_id", tab_id)
+            if session_id:
+                a.setdefault("session_id", session_id)
+            a.setdefault("task_id", task_id)
         action_ids = [f"{claim_id}:{i}" for i in range(len(actions))]
         results = [STATE.tx.run(a, page_url, consented, tab_id=tab_id) for a in actions]
         conflicts = sum(1 for r in results if r.get("verdict") in ("replan", "request_ownership"))
@@ -579,15 +630,45 @@ class Handler(BaseHTTPRequestHandler):
 
     def _lease(self, b: dict):
         if b.get("release"):
-            STATE.leases.release(b["release"])
-            return self._send(200, {"ok": True, "released": b["release"]})
+            # Compare-and-release: prefer the explicit (target, lease_id)
+            # form; falls back to lease-id lookup for backwards compat.
+            if b.get("target"):
+                ok = STATE.leases.release(b["target"], b["release"])
+            else:
+                ok = STATE.leases.release(b["release"])
+            return self._send(200, {"ok": ok, "released": b["release"]})
+        hierarchy = ()
+        if b.get("tab_id"):
+            from .concurrency import hierarchy_for
+            hierarchy = hierarchy_for(b.get("tab_id"), b.get("frame_id"),
+                                      b.get("session_id"))
         lease = STATE.leases.acquire(b.get("target", ""), b.get("intent", ""),
-                                     ttl=float(b.get("ttl", 2.0)))
+                                     ttl=float(b.get("ttl", 2.0)),
+                                     task_id=b.get("task_id"),
+                                     owner_hierarchy=hierarchy)
         if lease is None:
+            if STATE.leases.stopped:
+                return self._send(409, {"ok": False,
+                                        "error": "emergency stop active"})
             return self._send(409, {"ok": False,
-                                    "error": "target human-owned or conflicted; replan or request ownership"})
-        STATE.bus.emit("agent.lease", {"lease": lease["lease"], "target": lease["target"]})
+                                    "error": "target held by another lease, "
+                                             "human-owned, or conflicted; "
+                                             "replan or request ownership"})
+        STATE.bus.emit("agent.lease", {"lease": lease["lease"], "target": lease["target"],
+                                       "task_id": b.get("task_id"),
+                                       "tab_id": b.get("tab_id", "default")})
         return self._send(200, {"ok": True, **lease})
+
+    def _estop(self, b: dict):
+        """Global emergency stop: revoke all agent leases, block new ones."""
+        if b.get("active", True):
+            revoked = STATE.leases.emergency_stop()
+            STATE.bus.emit("agent.estop", {"active": True, "revoked": revoked})
+            return self._send(200, {"ok": True, "emergency_stop": True,
+                                    "leases_revoked": revoked})
+        STATE.leases.clear_emergency()
+        STATE.bus.emit("agent.estop", {"active": False})
+        return self._send(200, {"ok": True, "emergency_stop": False})
 
     def _workflow_observe(self, b: dict):
         steps = b.get("steps", [])
@@ -596,7 +677,8 @@ class Handler(BaseHTTPRequestHandler):
         confirmed = []
         for c in STATE.miner.candidates():
             if c["observed_runs"] >= 3 or (c["observed_runs"] >= 2 and b.get("confirm")):
-                name = f"{c['domain'] or 'web'}/{abs(hash(tuple(c['steps']))) % 10000:04d}"
+                from .session import stable_id as _stable_id
+                name = f"{c['domain'] or 'web'}/{_stable_id('wf', *(c['steps'] or []))[-4:]}"
                 STATE.wfmem.confirm(name, c["domain"], b.get("intent", c["steps"][0]),
                                     c["steps"], c["confidence"], c["observed_runs"])
                 confirmed.append(name)
