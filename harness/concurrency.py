@@ -340,68 +340,52 @@ class ConflictDetector:
 
 
 class TransactionRunner:
-    """READ -> PLAN -> RESERVE -> VALIDATE PRECONDITIONS -> EXECUTE -> VERIFY."""
+    """Legacy entrypoint (pre-Stage-C contract), preserved for the headless
+    benchmark and older callers.
+
+    Delegates to :class:`harness.transactions.TransactionEngine` in
+    non-strict mode and maps the result back to the legacy dict shape
+    ``{"ok", "verdict", "error"}``. IMPORTANT: the legacy ``"executed"``
+    verdict means "dispatched and acknowledged by the executor" -- it does
+    NOT mean the action was independently verified. New code must use
+    ``harness.gateway.ExecutionGateway`` / ``TransactionEngine`` in strict
+    mode, where VERIFIED requires postcondition-satisfying observation.
+    """
 
     def __init__(self, world, ownership: OwnershipGraph,
                  leases: LeaseManager, tools, safety):
-        self.world = world            # WorldState
-        self.ownership = ownership
-        self.leases = leases
-        self.tools = tools            # ToolExecutor
-        self.safety = safety          # SafetyLayer
+        # Late import: transactions.py imports names from this module.
+        from .transactions import TransactionEngine
+        from .context_manager import ContextManager
+        from .verification.verifier import Verifier
+        self.world = world
+        self.engine = TransactionEngine(
+            world, ownership, leases, tools, safety,
+            ContextManager(), Verifier(world))
 
     def run(self, action: dict, page_url: str = "",
             user_consented: bool = False, tab_id: str = "default") -> dict:
-        target = str(action.get("target", action.get("selector",
-                       action.get("ref", "?"))))
-        # RESERVE (exclusive, hierarchy-aware)
-        hierarchy = hierarchy_for(action.get("tab_id", tab_id),
-                                  action.get("frame_id"),
-                                  action.get("session_id"))
-        lease = self.leases.acquire(target, action.get("intent", ""),
-                                    ttl=float(action.get("lease_ttl", 2.0)),
-                                    task_id=action.get("task_id"),
-                                    action_id=action.get("action_id"),
-                                    owner_hierarchy=hierarchy)
-        if lease is None:
-            self.safety.log(action, "denied:ownership-conflict")
-            return {"ok": False, "verdict": "request_ownership",
-                    "error": f"cannot reserve {target}: held by another lease, "
-                             f"human-owned, or conflicted"}
-        action = {**action, "lease": lease["lease"],
-                  "tab_id": action.get("tab_id", tab_id)}
-        # VALIDATE PRECONDITIONS (intent-level)
-        verdict, reason = ConflictDetector.check(
-            action, _WorldView(self.world, self.ownership))
-        if verdict != "continue":
-            self.leases.release(target, lease["lease"])
-            self.safety.log(action, f"denied:{verdict}:{reason}")
-            return {"ok": False, "verdict": verdict, "error": reason}
-        # EXECUTE via existing guarded tools (safety allowlist still applies)
-        tool_action = {"tool": action.get("tool", action.get("command", "")),
-                       **{k: v for k, v in action.items()
-                          if k not in ("target", "intent", "preconditions")}}
-        res = self.tools.run(tool_action, page_url, user_consented, tab_id=tab_id)
-        # VERIFY
-        verified = res.get("ok", False)
-        for check in action.get("verification", []):
-            if not self._verify(check):
-                verified = False
-                res = {**res, "ok": False, "verify_failed": check}
-        self.leases.release(target, lease["lease"])
-        res["verdict"] = "executed" if verified else "failed-verification"
-        return res
-
-    def _verify(self, check: str) -> bool:
-        # Minimal verifiers; unknown checks pass (extension confirms visually).
-        if check == "no_modal_blocking":
-            return not self.world.interaction.get("modal")
-        return True
-
-
-class _WorldView:
-    """Adapter so ConflictDetector sees world + ownership together."""
-
-    def __init__(self, world, ownership):
-        self.world = world
-        self.ownership = ownership
+        from .transactions import (CONFLICTING, FAILED, OWNERSHIP_CONFLICT,
+                                   UNVERIFIED, VERIFIED)
+        report = self.engine.execute(
+            [action], task_id=action.get("task_id") or "legacy",
+            tab_id=action.get("tab_id", tab_id), page_url=page_url,
+            user_consented=user_consented, strict=False)
+        ex = report.executions[0]
+        d = ex.to_dict()
+        if ex.state == CONFLICTING:
+            verdict = getattr(ex, "conflict_verdict", None) \
+                or ("request_ownership"
+                    if ex.error_code == OWNERSHIP_CONFLICT else "replan")
+            return {"ok": False, "verdict": verdict, "error": ex.error,
+                    "error_code": ex.error_code, "state": ex.state}
+        if ex.state == FAILED:
+            return {"ok": False, "verdict": "failed", "error": ex.error,
+                    "error_code": ex.error_code, "state": ex.state,
+                    "verification": ex.verification}
+        # ACKNOWLEDGED / VERIFIED / UNVERIFIED: the executor accepted the
+        # command (legacy "executed" semantic; see class docstring).
+        return {"ok": True, "verdict": "executed",
+                "command": d.get("command"), "args": d.get("args"),
+                "state": ex.state, "claim_id": ex.claim_id,
+                "verification": ex.verification}

@@ -130,6 +130,19 @@ class State:
         self.scheduler = ParallelScheduler(self.ownership)
         # Beta.2 Truth Layer: Independent Verifier
         self.verifier = Verifier(self.world)
+        # Stage C: honest transaction lifecycle + execution gateway +
+        # closed-loop agent. ExecutionGateway.execute() is the single
+        # execution entrypoint used by /act, /transact, the extension,
+        # Tauri, and tests.
+        from .transactions import TransactionEngine
+        from .gateway import ExecutionGateway
+        from .orchestrator import AgentLoop
+        self.engine = TransactionEngine(self.world, self.ownership,
+                                        self.leases, self.tools, self.safety,
+                                        self.ctx, self.verifier)
+        self.gateway = ExecutionGateway(self.engine, mem=self.mem,
+                                        emit=self.bus.emit)
+        self.agent = AgentLoop(self, self.llm)
         # Use the ladder with WebMCP integration
         self.ladder = ExecutionLadder(webmcp_adapter=self.webmcp_adapter)
 
@@ -254,6 +267,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._act(b)
         if path == "/transact":
             return self._transact(b)
+        # Stage C: closed-loop agent endpoints (the extension's new runTask).
+        if path == "/agent/begin":
+            return self._agent_begin(b)
+        if path == "/agent/observe":
+            return self._agent_observe(b)
+        if path == "/agent/next":
+            return self._agent_next(b)
+        if path == "/agent/report":
+            return self._agent_report(b)
+        if path == "/agent/status":
+            return self._agent_status(b)
         if path == "/event":
             ev = STATE.bus.emit(b.get("type", "unknown"), b.get("data", {}))
             return self._send(200, {"ok": True, "event": ev,
@@ -424,9 +448,13 @@ class Handler(BaseHTTPRequestHandler):
                                                 snapshot_hash=view["hash"],
                                                 window_id=window_id,
                                                 session_id=sess.session_id)
-        STATE.world.load_full(url, view["nodes"], title, tab_id=tab_id,
-                              session_id=sess.session_id, window_id=window_id)
+        # Stage C dedup: the snapshot used to be journaled twice -- once by the
+        # direct world.load_full() call below and once via the page.loaded
+        # bus event. Now there is exactly one ingest path: the bus event
+        # carries the full snapshot payload and _on_event applies it once.
         STATE.bus.emit("page.loaded", {"url": url, "title": title,
+                                       "nodes": view["nodes"],
+                                       "full": True,
                                        "tab_id": tab_id, "window_id": window_id,
                                        "frame_id": frame_id,
                                        "session_id": sess.session_id,
@@ -507,126 +535,176 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, plan)
 
     def _act(self, b: dict):
-        tab_id = b.get("tab_id", "default")
-        session_id = b.get("session_id")
-        page_url = b.get("page_url", "")
-        consented = bool(b.get("user_consented", False))
-        task_id = b.get("task_id") or new_id("t")
-        claim_id = b.get("claim_id") or new_id("c")
-        actions = b.get("actions") or ([b["action"]] if "action" in b else [])
-        # Identity is captured on the action; execution targets the tab the
-        # task started on, never the browser's "current tab".
-        for a in actions:
-            a.setdefault("tab_id", tab_id)
-            if session_id:
-                a.setdefault("session_id", session_id)
-            a.setdefault("task_id", task_id)
-        action_ids = [f"{claim_id}:{i}" for i in range(len(actions))]
-        results = [STATE.tools.run(a, page_url, consented, tab_id=tab_id) for a in actions]
-        now = time.time()
-        for i, (a, r) in enumerate(zip(actions, results)):
-            STATE.mem.learn_from_action(a)
-            STATE.mem.record(page_url, a, json.dumps(r)[:500], b.get("note", ""))
-            target = a.get("target", a.get("selector", a.get("ref")))
-            STATE.bus.emit("agent.action", {"command": r.get("command", a.get("tool")),
-                                            "target": target,
-                                            "ok": r.get("ok"),
-                                            "task_id": task_id,
-                                            "action_id": action_ids[i],
-                                            "tab_id": tab_id})
-            # Honest tool-execution evidence: BROWSER_EVENT only.
-            # Real DOM/URL confirmation must arrive via /snapshot or /event.
-            STATE.verifier.record_evidence(Evidence(
-                evidence_id=f"e_{uuid.uuid4().hex[:8]}",
-                evidence_type=BROWSER_EVENT,
-                source="runtime",
-                timestamp=now,
-                action_id=action_ids[i],
-                task_id=task_id,
-                world_state_version=STATE.world.version,
-                payload={"command": a.get("tool"), "target": target,
-                         "ok": r.get("ok"), "tab_id": tab_id},
-            ))
-        # One claim per /act batch; claimed_state from first action (or explicit override).
-        claimed_state = b.get("claimed_state")
-        if claimed_state is None and actions:
-            claimed_state = _claimed_state_for_action(actions[0])
-        STATE.verifier.propose_claim(Claim(
-            claim_id=claim_id,
-            task_id=task_id,
-            actor="agent",
-            claim_type="ACTION_COMPLETED",
-            target=str(actions[0].get("target", actions[0].get("selector", actions[0].get("ref", "?")))) if actions else "?",
-            requested_state=actions[0] if actions else {},
-            claimed_state=claimed_state,
-            action_ids=action_ids,
-        ))
-        verification = STATE.verifier.verify(claim_id).to_dict()
-        STATE.bus.emit("agent.action_verified", {"claim_id": claim_id, "task_id": task_id,
-                                                 "result": verification.get("result"),
-                                                 "tab_id": tab_id})
+        """Single-action / action-batch execution.
+
+        Thin adapter over ExecutionGateway.execute(): the gateway runs the
+        honest lifecycle (REQUEST -> VALIDATE -> RESERVE -> PRECONDITION
+        CHECK -> DISPATCH -> ACK -> OBSERVE -> VERIFY -> COMMIT), records
+        per-action claims with the global verifier, and returns the
+        aggregate transaction status. This endpoint only shapes the
+        response; it adds no execution semantics of its own.
+        """
+        out = STATE.gateway.execute({
+            "actions": b.get("actions") or ([b["action"]] if "action" in b else []),
+            "task_id": b.get("task_id"),
+            "tab_id": b.get("tab_id", "default"),
+            "session_id": b.get("session_id"),
+            "window_id": b.get("window_id", "win_default"),
+            "frame_id": b.get("frame_id", "main"),
+            "page_url": b.get("page_url", ""),
+            "user_consented": bool(b.get("user_consented", False)),
+            "note": b.get("note", ""),
+        })
+        # Compatibility keys: the first action's verification + claim id,
+        # and the legacy per-action "results" list (execution outcomes).
+        verifications = out["verifications"]
+        results = [{"ok": e["state"] not in ("FAILED", "CONFLICTING", "CANCELLED"),
+                    "tool": e["tool"], "state": e["state"],
+                    "error_code": e["error_code"], "error": e["error"]}
+                   for e in out["action_results"]]
         return self._send(200, {"results": results,
-                                "task_id": task_id,
-                                "claim_id": claim_id,
-                                "verification": verification,
+                                "task_id": out["task_id"],
+                                "transaction_id": out["transaction_id"],
+                                "transaction_status": out["transaction_status"],
+                                "action_results": out["action_results"],
+                                "verifications": verifications,
+                                "claim_id": (verifications[0]["claim_id"]
+                                             if verifications else None),
+                                "verification": verifications[0]
+                                if verifications else None,
+                                "latency_ms": out["latency_ms"],
                                 "paused_for_user": STATE.tools.paused_for_user})
 
-
     def _transact(self, b: dict):
-        """Transactional co-execution: lease -> validate -> execute -> verify."""
-        tab_id = b.get("tab_id", "default")
-        session_id = b.get("session_id")
-        page_url = b.get("page_url", "")
-        consented = bool(b.get("user_consented", False))
-        task_id = b.get("task_id") or new_id("t")
-        claim_id = b.get("claim_id") or new_id("c")
-        actions = b.get("actions") or ([b["action"]] if "action" in b else [])
-        for a in actions:
-            a.setdefault("tab_id", tab_id)
-            if session_id:
-                a.setdefault("session_id", session_id)
-            a.setdefault("task_id", task_id)
-        action_ids = [f"{claim_id}:{i}" for i in range(len(actions))]
-        results = [STATE.tx.run(a, page_url, consented, tab_id=tab_id) for a in actions]
-        conflicts = sum(1 for r in results if r.get("verdict") in ("replan", "request_ownership"))
-        now = time.time()
-        for i, (a, r) in enumerate(zip(actions, results)):
-            STATE.mem.record(page_url, a, json.dumps(r)[:500], b.get("note", "tx"))
-            target = a.get("target", a.get("selector", a.get("ref")))
-            STATE.bus.emit("agent.action", {"command": a.get("tool"),
-                                            "target": target, "ok": r.get("ok"),
-                                            "verdict": r.get("verdict"),
-                                            "task_id": task_id,
-                                            "action_id": action_ids[i],
-                                            "tab_id": tab_id})
-            STATE.verifier.record_evidence(Evidence(
-                evidence_id=f"e_{uuid.uuid4().hex[:8]}",
-                evidence_type=BROWSER_EVENT,
-                source="runtime", timestamp=now,
-                action_id=action_ids[i], task_id=task_id,
-                world_state_version=STATE.world.version,
-                payload={"command": a.get("tool"), "target": target,
-                         "ok": r.get("ok"), "verdict": r.get("verdict"),
-                         "tab_id": tab_id},
-            ))
-        claimed_state = b.get("claimed_state")
-        if claimed_state is None and actions:
-            claimed_state = _claimed_state_for_action(actions[0])
-        STATE.verifier.propose_claim(Claim(
-            claim_id=claim_id, task_id=task_id, actor="agent",
-            claim_type="ACTION_COMPLETED",
-            target=str(actions[0].get("target", actions[0].get("selector", actions[0].get("ref", "?")))) if actions else "?",
-            requested_state=actions[0] if actions else {},
-            claimed_state=claimed_state, action_ids=action_ids,
-        ))
-        verification = STATE.verifier.verify(claim_id).to_dict()
-        STATE.bus.emit("agent.action_verified", {"claim_id": claim_id, "task_id": task_id,
-                                                 "result": verification.get("result"),
-                                                 "tab_id": tab_id})
+        """Transactional co-execution via the execution gateway.
+
+        Previously ran its own ad-hoc lease/execute/verify sequence with a
+        single batch claim; now every action gets its own lifecycle,
+        exclusive lease, and per-action claim. Returns the aggregate
+        transaction status (COMMITTED / PARTIALLY_COMMITTED / FAILED /
+        UNVERIFIED).
+        """
+        out = STATE.gateway.execute({
+            "actions": b.get("actions") or ([b["action"]] if "action" in b else []),
+            "task_id": b.get("task_id"),
+            "transaction_id": b.get("transaction_id"),
+            "tab_id": b.get("tab_id", "default"),
+            "session_id": b.get("session_id"),
+            "window_id": b.get("window_id", "win_default"),
+            "frame_id": b.get("frame_id", "main"),
+            "page_url": b.get("page_url", ""),
+            "user_consented": bool(b.get("user_consented", False)),
+            "note": b.get("note", "tx"),
+        })
+        verifications = out["verifications"]
+        results = [{"ok": e["state"] not in ("FAILED", "CONFLICTING", "CANCELLED"),
+                    "tool": e["tool"], "state": e["state"],
+                    "verdict": ("executed" if e["state"] == "VERIFIED"
+                                else "replan"),
+                    "error_code": e["error_code"], "error": e["error"]}
+                   for e in out["action_results"]]
+        conflicts = sum(1 for r in results
+                        if r["state"] in ("CONFLICTING", "CANCELLED"))
         return self._send(200, {"results": results, "conflicts": conflicts,
-                                "task_id": task_id, "claim_id": claim_id,
-                                "verification": verification,
+                                "task_id": out["task_id"],
+                                "transaction_id": out["transaction_id"],
+                                "transaction_status": out["transaction_status"],
+                                "action_results": out["action_results"],
+                                "verifications": verifications,
+                                "claim_id": (verifications[0]["claim_id"]
+                                             if verifications else None),
+                                "verification": verifications[0]
+                                if verifications else None,
+                                "latency_ms": out["latency_ms"],
                                 "ownership": STATE.ownership.snapshot()})
+
+    def _agent_begin(self, b: dict):
+        """Start a task-scoped closed loop: mint task_id, pin tab identity."""
+        goal = b.get("goal", "")
+        identity = b.get("identity") or {}
+        ctx = STATE.agent.begin(goal, identity,
+                                max_steps=int(b.get("max_steps", 15)))
+        return self._send(200, {"ok": True, "task_id": ctx.task_id,
+                                "goal": goal,
+                                "tab_id": ctx.tab_id,
+                                "window_id": ctx.window_id,
+                                "frame_id": ctx.frame_id,
+                                "max_steps": ctx.max_steps})
+
+    def _agent_view(self, tab_id: str) -> dict:
+        obs = STATE.world.tab_observation(tab_id) or {}
+        return {"url": obs.get("url", ""), "observation_id":
+                obs.get("observation_id"),
+                "snapshot_version": obs.get("observation_version")}
+
+    def _agent_observe(self, b: dict):
+        """OBSERVE: ingest the latest world state for the task's pinned tab.
+
+        The fresh snapshot itself arrives via /snapshot (extension push or
+        CDP pull); this call only compares the task's pinned context against
+        current world state and returns change flags the client uses on the
+        next step.
+        """
+        ctx = STATE.agent.get(b.get("task_id", ""))
+        if ctx is None:
+            return self._send(404, {"ok": False, "error": "unknown task_id"})
+        flags = STATE.agent.observe(ctx, self._agent_view(ctx.tab_id))
+        return self._send(200, {"ok": True, "task_id": ctx.task_id,
+                                "flags": flags,
+                                "steps_used": ctx.steps_used,
+                                "steps_remaining": ctx.max_steps - ctx.steps_used,
+                                "status": ctx.status})
+
+    def _agent_next(self, b: dict):
+        """OBSERVE + SELECT CAPABILITY + PLAN + VALIDATE + LEASE.
+
+        Returns {"decision": "act", "action": {...lease held...}} or a
+        terminal decision (success | continue | replan | request-human |
+        abort). The caller executes at most ONE mutation for "act", then
+        pushes the post-action snapshot via /snapshot and calls /agent/report.
+        """
+        ctx = STATE.agent.get(b.get("task_id", ""))
+        if ctx is None:
+            return self._send(404, {"ok": False, "error": "unknown task_id"})
+        flags = STATE.agent.observe(ctx, self._agent_view(ctx.tab_id))
+        decision = STATE.agent.next_action(ctx, flags)
+        return self._send(200, {"ok": True, "task_id": ctx.task_id,
+                                "flags": flags, **decision})
+
+    def _agent_report(self, b: dict):
+        """VERIFY + DECIDE. status in {executed, not_executed, browser_failed}.
+
+        The client MUST push the post-action observation via /snapshot
+        before calling this with status="executed"; the loop records that
+        fresh canonical-state read as evidence and re-verifies the claim.
+        """
+        ctx = STATE.agent.get(b.get("task_id", ""))
+        if ctx is None:
+            return self._send(404, {"ok": False, "error": "unknown task_id"})
+        decision = STATE.agent.report(
+            ctx, b.get("action_id"), b.get("claim_id"),
+            b.get("status", "executed"),
+            error_code=b.get("error_code"), reason=b.get("reason"))
+        return self._send(200, {"ok": True, "task_id": ctx.task_id,
+                                "verified": ctx.verified,
+                                "replans": ctx.replans,
+                                "steps_used": ctx.steps_used,
+                                "status": ctx.status, **decision})
+
+    def _agent_status(self, b: dict):
+        ctx = STATE.agent.get(b.get("task_id", ""))
+        if ctx is None:
+            return self._send(404, {"ok": False, "error": "unknown task_id"})
+        return self._send(200, {"ok": True, "task_id": ctx.task_id,
+                                "goal": ctx.goal, "tab_id": ctx.tab_id,
+                                "status": ctx.status,
+                                "steps_used": ctx.steps_used,
+                                "steps_remaining": ctx.max_steps - ctx.steps_used,
+                                "verified": ctx.verified,
+                                "replans": ctx.replans,
+                                "consecutive_failures":
+                                    ctx.consecutive_failures,
+                                "history": ctx.history[-20:]})
 
     def _lease(self, b: dict):
         if b.get("release"):
