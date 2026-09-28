@@ -23,9 +23,12 @@ async function capture(goal = "") {
   const tab = await currentTab();
   if (!tab?.id) throw new Error("no active tab");
   const snap = await chrome.tabs.sendMessage(tab.id, { type: "CAPTURE", goal });
-  // also push to harness for trimming/versioning
+  // also push to harness for trimming/versioning; tab identity is explicit
+  // so the harness never has to infer the execution target later.
   const view = await harness("/snapshot", {
     url: snap.url, nodes: snap.nodes, goal,
+    tab_id: String(tab.id), window_id: String(tab.windowId),
+    frame_id: "main",
   });
   return { tab, view };
 }
@@ -40,7 +43,7 @@ function selectorFor(view, ref) {
   return n?.selector || null;
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   (async () => {
     if (msg.type === "HUMAN_ACTIVE") {
       // Forward pause flag; best-effort (harness may be offline).
@@ -51,6 +54,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       reply(out);
     } else if (msg.type === "GET_LOG") {
       reply({ log: log.slice(-100) });
+    } else if (msg.type === "GET_TAB_ID") {
+      // Content scripts cannot read their own tab id; the background relays
+      // it so every extension-originated event carries explicit tab identity.
+      reply({ tab_id: sender?.tab?.id ?? null,
+              window_id: sender?.tab?.windowId ?? null });
     }
   })().catch((e) => reply({ ok: false, error: String(e?.message || e) }));
   return true; // async reply
@@ -59,12 +67,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 async function runTask(goal, opts = {}) {
   const trail = [];
   const consent = !!opts.userConsented;
-  let view;
+  let view, taskTab;
   try {
-    ({ view } = await capture(goal));
+    // Pin the execution target NOW: every later step addresses this tab
+    // explicitly. The browser's "current tab" is never consulted again,
+    // so a user tab-switch mid-task cannot redirect agent actions.
+    ({ tab: taskTab, view } = await capture(goal));
   } catch (e) {
     return { ok: false, error: `capture failed: ${e.message}` };
   }
+  const tabId = String(taskTab.id), windowId = String(taskTab.windowId);
   const plan = await harness("/plan", { goal });
   const actions = plan.actions || [];
   for (const a of actions) {
@@ -78,13 +90,13 @@ async function runTask(goal, opts = {}) {
     if (a.tool === "bulk") {
       const res = await harness("/act", {
         actions: a.actions, page_url: view.url, user_consented: consent,
+        tab_id: tabId, window_id: windowId, frame_id: "main",
       });
-      // execute each allowed command on the page
-      const tab = await currentTab();
+      // execute each allowed command on the PINNED task tab
       for (const c of res.results?.[0]?.executed || []) {
         const sel = c.args?.ref ? selectorFor(view, c.args.ref) : c.args?.selector;
         if (c.command === "navigate" || c.command === "snapshot") continue;
-        await executeOnPage(tab.id, c.command,
+        await executeOnPage(taskTab.id, c.command,
           { ...c.args, selector: sel || c.args?.selector });
       }
       trail.push({ kind: "bulk", result: res.results?.[0] });
@@ -96,6 +108,7 @@ async function runTask(goal, opts = {}) {
                 target: a.target || (a.ref != null ? selectorFor(view, a.ref)
                                                    : a.selector || "?") },
       page_url: view.url, user_consented: consent,
+      tab_id: tabId, window_id: windowId, frame_id: "main",
     });
     const r = res.results?.[0];
     trail.push({ kind: "transact", action: a, result: r });
@@ -111,9 +124,9 @@ async function runTask(goal, opts = {}) {
                conflicts: (res.conflicts || 0) + 1 };
     }
     if (r?.ok && r?.command && !["snapshot", "navigate", "ask_user", "summarize"].includes(r.command)) {
-      const tab = await currentTab();
+      // Pinned tab: never re-resolve "current tab" mid-task.
       const sel = r.args?.ref ? selectorFor(view, r.args.ref) : r.args?.selector;
-      await executeOnPage(tab.id, r.command, { ...r.args, selector: sel || r.args?.selector });
+      await executeOnPage(taskTab.id, r.command, { ...r.args, selector: sel || r.args?.selector });
     }
     if (!r?.ok) break; // spec 2: ask user rather than stubbornly retry
   }
