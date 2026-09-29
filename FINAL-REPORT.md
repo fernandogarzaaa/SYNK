@@ -116,8 +116,13 @@ benchmarked (dependencies, FIFO, tab-lease blocking).
   `benchmark/results.json`.
 - **Adversarial suite:** `tests/test_adversarial.py`, 40 tests, all
   attacks fail closed (see section 5).
-- **Tauri shell:** verified what can be verified without a Rust
-  toolchain (see section 6).
+- **Tauri shell:** `cargo check --locked` run locally with a
+  freshly installed Rust toolchain (rustc/cargo 1.98.1 stable):
+  passes with zero warnings and zero errors (see section 6). The
+  check caught one real build-order issue (missing `shell/dist`
+  panics `tauri::generate_context!()` at compile time), fixed by
+  building the frontend first. Packaged-app bundling remains
+  unvalidated (see section 6).
 - **Docs:** README rewritten as an operator manual; this report.
 
 ## 3. Verification evidence
@@ -219,12 +224,33 @@ Stated plainly; nothing here is presented as done:
    deterministic fake backend (70 Stage D tests), but never against a
    real Chrome/CDP session. Real-page verification rates and
    interaction timings are UNMEASURED.
-2. **Tauri shell: `cargo check` not run here.** No Rust toolchain in
-   this environment. Verified locally: handler/command parity,
-   frontend invoke parity, `tauri.conf.json` validity and version
-   consistency, and a full vite production build. `cargo check` and the
-   packaged app remain CI-verified only. The shell is labeled
-   EXPERIMENTAL.
+2. **Tauri shell: `cargo check` now run locally (2026-09-29).** A
+   Rust toolchain was installed (rustc/cargo 1.98.1, stable) and
+   `cargo check --locked` in `shell/src-tauri` passes with zero
+   warnings and zero errors. Two environment notes, both verified
+   the hard way: the frontend must be built first (`npm run build`
+   in `shell/`), because `tauri::generate_context!()` panics at
+   compile time when `shell/dist` is missing; and on Ubuntu 24.04
+   the locked Tauri 1.8.3 / wry 0.24.12 / webkit2gtk-sys 0.18.0
+   tree probes for WebKitGTK 4.0 pkg-config names
+   (`webkit2gtk-4.0`, `javascriptcoregtk-4.0`) that the distro no
+   longer ships (only 4.1 dev packages exist), so the check ran
+   with a local-only pkg-config shim mapping the 4.0 names onto
+   the installed 4.1 packages (no repo change); linking
+   additionally needed `libwebkit2gtk-4.0.so` /
+   `libjavascriptcoregtk-4.0.so` names, provided as symlinks to the
+   installed 4.1 libraries (environment only). A full
+   `cargo build --locked` then links cleanly into a working
+   `synk-shell` binary, which was smoke-tested under Xvfb against a
+   running harness: it boots, creates its window, and runs with no
+   panics (only benign headless-GPU and WebKit deprecation
+   warnings). Installer packaging (`npm run tauri build`) and
+   click-through exercise of the five Tauri commands remain
+   unvalidated, so the shell stays labeled EXPERIMENTAL.
+   Previously verified items still stand:
+   handler/command parity, frontend invoke parity,
+   `tauri.conf.json` validity and version consistency, and a full
+   vite production build.
 3. **Unicode-obfuscation detection is pattern-bound, not
    universal** (see section 5). The hardened classifier catches
    NFKC-foldable forms (fullwidth Latin), the listed

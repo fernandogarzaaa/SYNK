@@ -68,7 +68,7 @@ Every subsystem carries one honest label:
 | Owned-browser adapter (Playwright/CDP) | PARTIAL | Implemented with honest mode separation; live-browser integration UNVERIFIED here |
 | WebMCP gateway | PARTIAL | Discovery, scoping, schema validation, policy; page model-context path needs a live page (UNVERIFIED here) |
 | Memory store | REAL | Task-scoped, session-isolated, secrets redacted before storage |
-| Tauri shell (`shell/`) | EXPERIMENTAL | Thin HTTP client over the harness API; Rust compile + prod build verified in CI, not run to a packaged app here |
+| Tauri shell (`shell/`) | EXPERIMENTAL | Thin HTTP client over the harness API; `cargo check` clean and full `cargo build` links on rustc 1.98.1; binary smoke-tested under Xvfb; installer packaging not validated here |
 | Benchmarks (`benchmark/`) | REAL | All numbers measured; methodology in `benchmark/REPORT.md` |
 
 Labels: REAL (implemented, tested, exercised), PARTIAL (real code with an
@@ -245,6 +245,25 @@ the Stage H run (Python 3.12.3, this machine):
   operator must do to verify the live-browser path.
 - **Not a production browser.** The Tauri shell is a thin operator UI
   over the harness HTTP API, EXPERIMENTAL, not a hardened product.
+  `cargo check --locked` passes locally on rustc 1.98.1 with zero
+  warnings. Build order matters: the frontend must be built first
+  (`npm run build` in `shell/`), because
+  `tauri::generate_context!()` panics at compile time when
+  `shell/dist` is missing (the check caught exactly this). On Ubuntu
+  24.04 the locked Tauri 1.8.3 / wry 0.24.12 tree probes for
+  WebKitGTK 4.0 pkg-config names that the distro no longer ships
+  (only 4.1 is available), so the local check ran with a temporary
+  pkg-config shim mapping the 4.0 names onto the installed 4.1 dev
+  packages (environment workaround only, no repo change). A full
+  `cargo build --locked` also links into a working `synk-shell`
+  binary (linking needed `libwebkit2gtk-4.0.so` /
+  `libjavascriptcoregtk-4.0.so` names, provided as symlinks to the
+  installed 4.1 libraries, environment only). The binary was
+  smoke-tested under Xvfb against a running harness: it boots,
+  creates its window, and runs with no panics (only benign
+  headless-GPU and WebKit deprecation warnings). Still unvalidated:
+  installer packaging (`npm run tauri build` producing dmg/msi/AppImage)
+  and click-through exercise of the five Tauri commands.
 - **No invented metrics.** Every number in `benchmark/REPORT.md` was
   measured by running `benchmark/runner.py`; removed legacy benchmark
   files existed only to compare mock agents on hard-coded timings.
