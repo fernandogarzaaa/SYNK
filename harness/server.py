@@ -18,19 +18,18 @@ from urllib.parse import urlparse
 
 from .benchmarks import suite as bench_suite
 from .compiler import compile_intent, ir_to_actions
-from .concurrency import (CONFLICT, HUMAN_OWNED, LeaseManager,
+from .concurrency import (LeaseManager,
                               OwnershipGraph, TransactionRunner)
 from .context_manager import ContextManager
 from .event_bus import EventBus
-from .session import SessionManager, new_id, MAIN_FRAME
-from .ladder import ExecutionLadder, LADDER
+from .session import SessionManager, MAIN_FRAME
+from .ladder import ExecutionLadder
 from .memory import MemoryStore
 from .orchestrator import Orchestrator
 from .router import pick_tier, tier_to_model_label
 from .safety import SafetyConfig, SafetyLayer
 from .tools import ToolExecutor
-from .webmcp import (WebMCPDiscovery, WebMCPAdapter, REGISTRY,
-                      CAPABILITY_POLICY, PolicyEngine)
+from .webmcp import (WebMCPDiscovery, WebMCPAdapter, PolicyEngine)
 from .workflows import WorkflowMemory, WorkflowMiner, classify
 from .world_state import WorldState
 from .local.runtime import LocalRuntime
@@ -38,7 +37,7 @@ from .scheduler.scheduler import ParallelScheduler
 from .verification.verifier import Verifier
 from .verification.claims import Claim
 from .verification.evidence import (
-    Evidence, BROWSER_EVENT, DOM_CHANGE, NAVIGATION, SCREENSHOT, URL_CHANGE,
+    Evidence, DOM_CHANGE, NAVIGATION, SCREENSHOT, URL_CHANGE,
 )
 from .world_state import WorldState
 from .browser import BrowserController
@@ -70,7 +69,8 @@ def _normalize_local_decision(decision: dict, goal: str = ""):
     action = {"tool": tool, "intent": goal}
     if decision.get("ref") is not None:
         action["ref"] = decision.get("ref")
-    for k in ("text", "value", "url", "selector", "direction", "key"):
+    for k in ("text", "value", "url", "selector", "direction", "key",
+              "tool_name", "args"):
         if decision.get(k) is not None:
             action[k] = decision.get(k)
     return action
@@ -92,7 +92,8 @@ def _claimed_state_for_action(action: dict):
 
 class State:
     def __init__(self, db_path: str, use_cdp: bool = False,
-                 cdp_endpoint: str = "", profile_dir: str = ""):
+                 cdp_endpoint: str = "", profile_dir: str = "",
+                 webmcp_fallback: bool = False):
         self.safety = SafetyLayer(SafetyConfig())
         self.ctx = ContextManager()
         self.mem = MemoryStore(db_path)
@@ -141,12 +142,42 @@ class State:
                                               ownership=self.ownership,
                                               leases=self.leases,
                                               safety=self.safety)
+        # Stage E: real WebMCP gateway. Default transport is the
+        # extension snapshot transport: attached-mode pages report their
+        # model-context tools with each snapshot, and invocations in
+        # attached mode go through the closed-loop extension path.
+        # _run_event_loop() swaps in the CDP transport once a managed
+        # browser is connected. The transport always reports the LIVE
+        # page; no static fallback is wired here (opt-in only).
+        from .webmcp.transport import ExtensionSnapshotTransport
+        from .webmcp.gateway import WebMCPGateway
+        from .webmcp.policy import PolicyEngine
+        # scope key string "session|tab|frame|document" ->
+        # {"tools": [...], "reason": str}. The document id in the key is
+        # the generation key: a navigation changes it, so a stale entry
+        # can never be returned for the new document.
+        self.webmcp_snapshots: dict = {}
+        snapshots = self.webmcp_snapshots
+        # Stage E: fixture fallback is opt-in only (flag or
+        # SYNK_WEBMCP_FALLBACK=1); default is fail closed.
+        self._webmcp_fallback_opt_in = bool(
+            webmcp_fallback or
+            __import__("os").environ.get("SYNK_WEBMCP_FALLBACK"))
+        self.webmcp_gateway = WebMCPGateway(
+            transport=ExtensionSnapshotTransport(
+                lambda scope_key: snapshots.get(scope_key)),
+            sessions=self.sessions,
+            policy_engine=PolicyEngine(self.ownership, self.safety),
+            allow_fallback=self._webmcp_fallback_opt_in,
+            emit=self.bus.emit)
+        self.tools.webmcp_gateway = self.webmcp_gateway
         # Beta.2: Local Intelligence Runtime
         self.local_runtime = LocalRuntime()
         # Beta.3: Parallel Scheduler
         self.scheduler = ParallelScheduler(self.ownership)
         # Beta.2 Truth Layer: Independent Verifier
         self.verifier = Verifier(self.world)
+        self.tools.verifier = self.verifier
         # Stage C: honest transaction lifecycle + execution gateway +
         # closed-loop agent. ExecutionGateway.execute() is the single
         # execution entrypoint used by /act, /transact, the extension,
@@ -186,6 +217,19 @@ class State:
         except Exception as e:
             print(f"Browser connect failed: {e}")
             self.browser_runtime = None
+        # Stage E: once a managed browser is connected, drive WebMCP from
+        # the live page's model context via CDP. Attached-extension mode
+        # keeps the snapshot transport (set in __init__).
+        try:
+            if getattr(self, "browser_runtime", None) is not None and \
+                    getattr(self.browser_runtime, "connected", False):
+                from .webmcp.transport import CdpModelContextTransport
+                rt = self.browser_runtime
+                self.webmcp_gateway.transport = CdpModelContextTransport(
+                    rt.evaluate_js)
+                print("WebMCP gateway: live model-context transport (CDP)")
+        except Exception as e:
+            print(f"WebMCP transport wiring failed: {e}")
         self.loop.run_forever()
 
     # -- bus fan-out -----------------------------------------------------------
@@ -296,9 +340,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"levels": STATE.ladder.describe()})
         if path == "/workflows":
             return self._send(200, {"workflows": STATE.wfmem.all_workflows()})
-        # Beta.1: WebMCP GET = list-only, no body
+        # Beta.1: WebMCP GET = list-only, no body (query params allowed)
         if path == "/webmcp/capabilities":
-            return self._webmcp_capabilities({})
+            from urllib.parse import parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            return self._webmcp_capabilities(
+                {k: v[0] for k, v in q.items() if v})
         return self._send(404, {"ok": False, "error": "not found"})
 
     # -- POST -------------------------------------------------------------------
@@ -444,11 +491,14 @@ class Handler(BaseHTTPRequestHandler):
             if d["payload"]["image_base64"] is None:
                 d["payload"]["image_base64"] = "<omitted: >1.5MB>"
             return self._send(200, {"ok": True, "evidence": d})
-        # Beta.1: WebMCP endpoints
+        # Beta.1: WebMCP endpoints (Stage E: discover/capabilities/invoke
+        # are real; /webmcp/execute is the legacy PARTIAL fixture path)
         if path == "/webmcp/discover":
             return self._webmcp_discover(b)
         if path == "/webmcp/capabilities":
             return self._webmcp_capabilities(b)
+        if path == "/webmcp/invoke":
+            return self._webmcp_invoke(b)
         if path == "/webmcp/execute":
             return self._webmcp_execute(b)
         return self._send(404, {"ok": False, "error": "not found"})
@@ -509,6 +559,35 @@ class Handler(BaseHTTPRequestHandler):
                                                 snapshot_hash=view["hash"],
                                                 window_id=window_id,
                                                 session_id=sess.session_id)
+        # Stage E: cache page-reported model-context tools under the scope
+        # key (session, tab, frame, document). The document id is the
+        # generation key: a navigation changes it, so a stale entry can
+        # never be returned for the new document. A page that reports no
+        # model context is cached as unavailable (never popped) so the
+        # gateway fails closed instead of falling through to a fixture.
+        webmcp = b.get("webmcp")
+        if isinstance(webmcp, dict):
+            from .webmcp.scope import WebMCPScope
+            doc_id = STATE.sessions.frame_document_id(
+                tab_id, frame_id, session_id=sess.session_id)
+            # The cache key IS the scope key: a navigation changes the
+            # document id, so a stale entry can never be returned for the
+            # new document.
+            key = WebMCPScope(session_id=sess.session_id, tab_id=tab_id,
+                              frame_id=frame_id,
+                              document_id=doc_id).key()
+            tools = webmcp.get("tools")
+            # Carry the page-REPORTED availability explicitly: a model
+            # context with zero tools is available, not unavailable.
+            page_available = bool(webmcp.get("available"))
+            if page_available and isinstance(tools, list):
+                STATE.webmcp_snapshots[key] = {
+                    "available": True, "tools": tools, "reason": ""}
+            else:
+                STATE.webmcp_snapshots[key] = {
+                    "available": False, "tools": [],
+                    "reason": (webmcp.get("unavailable_reason") or
+                               "webmcp_unavailable")}
         # Stage C dedup: the snapshot used to be journaled twice -- once by the
         # direct world.load_full() call below and once via the page.loaded
         # bus event. Now there is exactly one ingest path: the bus event
@@ -750,7 +829,8 @@ class Handler(BaseHTTPRequestHandler):
             ctx, b.get("action_id"), b.get("claim_id"),
             b.get("status", "executed"),
             error_code=b.get("error_code"), reason=b.get("reason"),
-            browser_ack=b.get("browser_ack"))
+            browser_ack=b.get("browser_ack"),
+            webmcp_result=b.get("webmcp_result"))
         return self._send(200, {"ok": True, "task_id": ctx.task_id,
                                 "verified": ctx.verified,
                                 "replans": ctx.replans,
@@ -835,40 +915,115 @@ class Handler(BaseHTTPRequestHandler):
                                 "candidates": STATE.miner.candidates(),
                                 "confirmed": confirmed})
 
-    # Beta.1: WebMCP endpoints
+    # Stage E: WebMCP endpoints (real model-context discovery per
+    # session/tab/frame, transaction-engine invocation, deterministic
+    # selection). /webmcp/execute below is the legacy Beta.1 fixture
+    # path, kept for compatibility and labeled PARTIAL.
+    def _webmcp_scope_from(self, b: dict):
+        scope = STATE.webmcp_gateway.scope_for(
+            b.get("session_id"), b.get("tab_id", "default"),
+            b.get("frame_id", "main"))
+        if scope is None:
+            raise ValueError("WEBMCP_SCOPE_VIOLATION: unknown tab/session "
+                             "(push a snapshot first)")
+        return scope
+
     def _webmcp_discover(self, b: dict):
-        origin = b.get("origin", "")
-        if not origin:
-            url = b.get("url", "")
-            try:
-                origin = url.split("//", 1)[1].split("/", 1)[0].lower()
-            except IndexError:
-                return self._send(400, {"ok": False, "error": "origin or url required"})
-        site = STATE.webmcp_discovery.discover(origin)
-        if site:
-            return self._send(200, {"ok": True, "site": {
-                "origin": site.origin,
-                "tools": [t.to_dict() for t in site.tools],
-                "discovered_at": site.discovered_at,
-            }})
-        return self._send(404, {"ok": False, "error": f"no WebMCP tools for {origin}"})
+        try:
+            scope = self._webmcp_scope_from(b)
+        except ValueError as e:
+            return self._send(400, {"ok": False, "error": str(e),
+                                    "error_code": "WEBMCP_SCOPE_VIOLATION"})
+        result = STATE.webmcp_gateway.discover(scope)
+        return self._send(200, {"ok": True,
+                                "available": result.get("available", False),
+                                "tools": result.get("tools", []),
+                                "document_id": scope.document_id,
+                                "scope": {"session_id": scope.session_id,
+                                          "tab_id": scope.tab_id,
+                                          "frame_id": scope.frame_id},
+                                "unavailable_reason": result.get("reason", ""),
+                                "fallback": {"enabled": False}})
 
     def _webmcp_capabilities(self, b: dict):
-        origin = b.get("origin", "")
+        """Deterministic capability selection for a goal (Stage E).
+
+        Returns the FULL selection record: every considered tool, its
+        score breakdown, the winner, and the rationale -- written to the
+        audit trail via the gateway bus.
+        """
         goal = b.get("goal", "")
-        caps = REGISTRY.get_for_origin(origin) if origin else REGISTRY.all()
-        if goal:
-            caps = REGISTRY.find_capabilities(goal, origin)
-        return self._send(200, {"ok": True, "capabilities": [
-            {"source": c.source, "origin": c.origin, "name": c.name,
-             "risk": c.risk, "latency_class": c.latency_class,
-             "semantic": c.semantic, "mutating": c.mutating,
-             "requires_user_consent": c.requires_user_consent,
-             "description": c.description}
-            for c in caps
-        ]})
+        try:
+            scope = self._webmcp_scope_from(b)
+        except ValueError as e:
+            return self._send(400, {"ok": False, "error": str(e),
+                                    "error_code": "WEBMCP_SCOPE_VIOLATION"})
+        result = STATE.webmcp_gateway.discover(scope)
+        record = STATE.webmcp_gateway.select(goal, scope)
+        return self._send(200, {"ok": True,
+                                "available": result.get("available", False),
+                                "goal": goal,
+                                "selection": record.to_dict()})
+
+    def _webmcp_invoke(self, b: dict):
+        """Invoke a page-advertised WebMCP tool (Stage E).
+
+        Routes through the transaction engine exactly like /act: the same
+        identity guards, lease reservation, claim proposal, evidence
+        recording, and per-action verification. ``goal`` without
+        ``tool_name`` triggers deterministic selection first (its full
+        rationale is echoed in the response).
+        """
+        tool_name = b.get("tool_name", "")
+        goal = b.get("goal", "")
+        selection = None
+        if not tool_name:
+            if not goal:
+                return self._send(400, {"ok": False,
+                                        "error": "tool_name or goal required"})
+            try:
+                scope = self._webmcp_scope_from(b)
+            except ValueError as e:
+                return self._send(400, {"ok": False, "error": str(e),
+                                        "error_code": "WEBMCP_SCOPE_VIOLATION"})
+            result = STATE.webmcp_gateway.discover(scope)
+            selection = STATE.webmcp_gateway.select(goal, scope)
+            if not selection.winner:
+                return self._send(404, {"ok": False,
+                                        "error": "no tool matched the goal",
+                                        "selection": selection.to_dict()})
+            tool_name = selection.winner
+        action = {"tool": "webmcp_invoke", "tool_name": tool_name,
+                  "args": b.get("args", {}), "intent": goal or tool_name}
+        out = STATE.gateway.execute({
+            "actions": [action],
+            "task_id": b.get("task_id"),
+            "tab_id": b.get("tab_id", "default"),
+            "session_id": b.get("session_id"),
+            "window_id": b.get("window_id", "win_default"),
+            "frame_id": b.get("frame_id", "main"),
+            "page_url": b.get("page_url", ""),
+            "user_consented": bool(b.get("user_consented", False)),
+            "note": b.get("note", ""),
+        })
+        verifications = out["verifications"]
+        resp = {"ok": out["transaction_status"] == "COMMITTED",
+                "tool_name": tool_name,
+                "task_id": out["task_id"],
+                "transaction_id": out["transaction_id"],
+                "transaction_status": out["transaction_status"],
+                "action_results": out["action_results"],
+                "verifications": verifications,
+                "verification": verifications[0] if verifications else None,
+                "latency_ms": out["latency_ms"]}
+        if selection is not None:
+            resp["selection"] = selection.to_dict()
+        return self._send(200, resp)
 
     def _webmcp_execute(self, b: dict):
+        # LEGACY Beta.1 path (pre-Stage E): the old adapter answers from
+        # its built-in fixture table without touching any page. Kept for
+        # compatibility; labeled PARTIAL and never verification-capable.
         origin = b.get("origin", "")
         tool = b.get("tool", "")
         args = b.get("args", {})
@@ -877,7 +1032,12 @@ class Handler(BaseHTTPRequestHandler):
         if not origin or not tool:
             return self._send(400, {"ok": False, "error": "origin and tool required"})
         res = STATE.webmcp_adapter.execute(origin, tool, args, goal, user_consented)
-        return self._send(200, {"ok": res.ok, "result": res.result, "error": res.error})
+        return self._send(200, {"ok": res.ok, "result": res.result,
+                                "error": res.error,
+                                "mode": "PARTIAL",
+                                "caveat": ("legacy fixture result: did not "
+                                           "come from a page; cannot verify "
+                                           "any live-page claim")})
 
 
 def _run_benchmarks() -> dict:
@@ -959,11 +1119,18 @@ def main() -> None:
     ap.add_argument("--profile-dir", default="",
                     help="Profile directory for managed launch (default: "
                          "~/.synk/chromium-profile).")
+    ap.add_argument("--webmcp-fallback", action="store_true",
+                    help="Opt in to the explicit PARTIAL WebMCP fixture "
+                         "fallback when the page has no model context. "
+                         "Fallback results are labeled as fixtures and can "
+                         "never verify a live-page claim. Default: off "
+                         "(fail closed).")
     args = ap.parse_args()
     global STATE
     STATE = State(args.db, use_cdp=args.use_cdp,
                   cdp_endpoint=args.cdp_endpoint,
-                  profile_dir=args.profile_dir)
+                  profile_dir=args.profile_dir,
+                  webmcp_fallback=args.webmcp_fallback)
     STATE._human_steps = []
     srv = HTTPServer(("127.0.0.1", args.port), Handler)
     print(f"ai-cowork harness on http://127.0.0.1:{args.port} (db={args.db} "

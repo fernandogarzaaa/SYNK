@@ -22,6 +22,10 @@ TOOL_SCHEMAS = {
     "ask_user": ["question"],
     "summarize": ["text"],
     "bulk": ["actions"],
+    # Stage E: WebMCP tool invocation through the page's model context.
+    # "args" is optional (defaults to {}); identity (tab/session/frame)
+    # is stamped by the gateway/engine, never optional at dispatch.
+    "webmcp_invoke": ["tool_name"],
 }
 
 
@@ -81,6 +85,10 @@ class ToolExecutor:
         self.browser = browser
         self.paused_for_user = False  # human-priority flag (spec 6)
         self.executed: list[dict] = []
+        # Stage E: the real WebMCP gateway (wired by server STATE; None in
+        # unit tests unless set). verifier likewise (falls back to STATE).
+        self.webmcp_gateway = None
+        self.verifier = None
 
 
     def set_human_active(self, active: bool) -> None:
@@ -106,6 +114,19 @@ class ToolExecutor:
             return res
         if tool == "bulk":
             return self.run_bulk(action.get("actions", []), page_url, user_consented, tab_id)
+        if tool == "webmcp_invoke":
+            # Stage E: WebMCP invocations go through the real gateway
+            # (page model-context discovery, handle scoping, policy), never
+            # through DOM dispatch. Safety allowlist still applies first.
+            ok, reason = self.safety.validate(
+                action, page_url, user_consented, self.paused_for_user)
+            self.safety.log(action, reason if not ok else "executed:webmcp_invoke")
+            if not ok:
+                if reason == "consent_required":
+                    return {"ok": False, "error": "consent_required",
+                            "consent_required": True, "tool": tool}
+                return {"ok": False, "error": reason}
+            return self._run_webmcp(action, page_url, user_consented, tab_id)
         ok, reason = self.safety.validate(
             action, page_url, user_consented, self.paused_for_user)
         self.safety.log(action, reason if not ok else f"executed:{tool}")
@@ -165,6 +186,80 @@ class ToolExecutor:
         self.executed.append(cmd)
         return cmd
 
+    def _run_webmcp(self, action: dict, page_url: str,
+                    user_consented: bool, tab_id: str) -> dict:
+        """Execute a webmcp_invoke action through the WebMCPGateway.
+
+        Records the page's tool report as WEBMCP_RESULT evidence so the
+        transaction's ``webmcp_result`` postcondition can be verified.
+        Fixture-fallback results are flagged ``partial_fallback`` in the
+        payload -- the verifier refuses them outright.
+        """
+        import time as _time
+        import uuid as _uuid
+        tool_name = action.get("tool_name", "")
+        args = action.get("args") or {}
+        gateway = self.webmcp_gateway
+        if gateway is None:
+            try:
+                from .server import STATE
+                gateway = getattr(STATE, "webmcp_gateway", None)
+            except Exception:
+                gateway = None
+        if gateway is None:
+            return {"ok": False, "tool": "webmcp_invoke",
+                    "error": "webmcp_unavailable: no WebMCP gateway wired",
+                    "error_code": "BROWSER_NOT_READY"}
+        scope = gateway.scope_for(action.get("session_id"), tab_id,
+                                  action.get("frame_id", "main"))
+        inv = gateway.invoke(tool_name, args, scope,
+                             task_id=action.get("task_id"),
+                             action_id=action.get("action_id"),
+                             user_consented=user_consented,
+                             goal=action.get("intent", ""))
+        res = inv.result
+        # Evidence: the page's own tool report. Recorded even on failure
+        # (ok=False results verify as FAILED, never as silent success).
+        verifier = self.verifier
+        if verifier is None:
+            try:
+                from .server import STATE
+                verifier = getattr(STATE, "verifier", None)
+            except Exception:
+                verifier = None
+        if verifier is not None:
+            try:
+                from .verification.evidence import (WEBMCP_RESULT, Evidence,
+                                                   strength_of)
+                verifier.record_evidence(Evidence(
+                    evidence_id=f"e_{_uuid.uuid4().hex[:8]}",
+                    evidence_type=WEBMCP_RESULT,
+                    source="webmcp", timestamp=_time.time(),
+                    action_id=action.get("action_id"),
+                    task_id=action.get("task_id"),
+                    payload={"tool": tool_name, "ok": res.ok,
+                             "result": res.result, "error": res.error,
+                             "partial_fallback": inv.partial,
+                             "handle_id": (inv.handle.handle_id
+                                           if inv.handle else None)},
+                    strength=strength_of(WEBMCP_RESULT),
+                    provenance=("fixture_fallback" if inv.partial
+                                else "page_model_context"),
+                ))
+            except Exception:
+                pass
+        out = {"ok": res.ok, "command": "webmcp_invoke", "args": action,
+               "tool_result": res.to_dict(),
+               "partial_fallback": inv.partial,
+               "error": res.error,
+               "error_code": inv.error_code
+               or (None if res.ok else "ACTION_FAILED")}
+        if inv.caveat:
+            out["caveat"] = inv.caveat
+        self.safety.log(action,
+                        f"webmcp:{tool_name}:{'ok' if res.ok else 'failed'}"
+                        f"{':partial' if inv.partial else ''}")
+        return out
 
     def run_bulk(self, actions: list[dict], page_url: str = "",
                     user_consented: bool = False, tab_id: str = "default") -> dict:

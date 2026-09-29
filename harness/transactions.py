@@ -36,7 +36,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .concurrency import (CONFLICT, HUMAN_OWNED, ConflictDetector,
+from .concurrency import (ConflictDetector,
                           LeaseManager, OwnershipGraph, hierarchy_for)
 from .session import new_id
 from .verification.claims import Claim
@@ -116,6 +116,13 @@ def postcondition_for(action: dict) -> dict | None:
                 "key": action.get("key")}
     if tool in ("hover", "focus"):
         return {"kind": "element_interaction", "target": target}
+    if tool == "webmcp_invoke":
+        # Stage E: the claim is "the page's model-context tool reported
+        # success". Verified only by a page-reported WEBMCP_RESULT naming
+        # this tool (fixture-fallback results are excluded by the
+        # verifier).
+        return {"kind": "webmcp_result",
+                "tool_name": action.get("tool_name")}
     return None
 
 
@@ -184,6 +191,12 @@ class ActionExecution:
             d["command"] = self.tool_result.get("command")
             d["args"] = self.tool_result.get("args")
             d["ok"] = self.tool_result.get("ok")
+            # Stage E: surface the WebMCP partial-fallback marker so
+            # callers can see a fixture answered (it never verifies).
+            if "partial_fallback" in self.tool_result:
+                d["partial_fallback"] = self.tool_result["partial_fallback"]
+            if self.tool_result.get("caveat"):
+                d["caveat"] = self.tool_result["caveat"]
         return d
 
 
@@ -349,6 +362,14 @@ class TransactionEngine:
                               if k not in ("target", "intent", "preconditions",
                                            "verification", "lease_ttl",
                                            "ref_version")}}
+            # Stage E: stamp the request's identity onto the dispatched
+            # action. The tool executor only sees this dict; webmcp_invoke
+            # needs (session, tab, frame) to scope its handle, and its
+            # evidence needs (task_id, action_id) to tie to the claim.
+            tool_action.setdefault("session_id", req.session_id)
+            tool_action.setdefault("frame_id", req.frame_id)
+            tool_action.setdefault("task_id", req.task_id)
+            tool_action["action_id"] = req.action_id
             res = self.tools.run(tool_action, req.page_url,
                                  req.user_consented, tab_id=tab_id)
             ex.tool_result = res
@@ -375,11 +396,10 @@ class TransactionEngine:
             return ex
         finally:
             if ex.lease_id:
-                # Match _reserve(): lease keys are str(target).
-                self.leases.release(str(req.action.get("target",
-                                        req.action.get("selector",
-                                        req.action.get("ref", "?")))),
-                                    ex.lease_id)
+                # Match _reserve(): lease keys come from _lease_target_for.
+                self.leases.release(
+                    _lease_target_for(req.action, req.tab_id),
+                    ex.lease_id)
 
     # -- lifecycle helpers -------------------------------------------------------------
     def _validate_reserve_precondition(self, ex: ActionExecution) -> bool:
@@ -443,9 +463,8 @@ class TransactionEngine:
             ex.error = reason
             ex.conflict_verdict = verdict  # legacy mapping aid
             self.safety.log(action, f"denied:{verdict}:{reason}")
-            self.leases.release(str(action.get("target",
-                                action.get("selector",
-                                action.get("ref", "?")))), ex.lease_id)
+            self.leases.release(
+                _lease_target_for(action, req.tab_id), ex.lease_id)
             ex.lease_id = None
             return True
         return False
@@ -492,8 +511,10 @@ class TransactionEngine:
 
     def _reserve(self, req: ActionRequest) -> dict | None:
         action = req.action
-        target = str(action.get("target", action.get("selector",
-                       action.get("ref", "?"))))
+        # Stage E: WebMCP invocations lease the tool handle in the tab, not
+        # a DOM node (see _lease_target_for). Every release site uses the
+        # same helper so acquire/release keys always match.
+        target = _lease_target_for(action, req.tab_id)
         held = action.get("lease")
         if held:
             # Adopt a lease pre-acquired by /agent/step: it must still be
@@ -512,6 +533,11 @@ class TransactionEngine:
 
     @staticmethod
     def _classify_tool_error(res: dict, tool: str) -> tuple[str, str]:
+        # Stage E: executors that classify their own failures (the WebMCP
+        # gateway) attach a taxonomy code; honor it verbatim.
+        code = res.get("error_code")
+        if code in ERROR_CODES:
+            return code, str(res.get("error", "tool failed"))
         err = str(res.get("error", "tool failed"))
         if res.get("consent_required") or "consent_required" in err:
             return CONSENT_REQUIRED, err
@@ -744,3 +770,17 @@ def _bounded(v: float, lo: float, hi: float) -> float:
     except (TypeError, ValueError):
         v = lo
     return max(lo, min(hi, v))
+
+
+def _lease_target_for(action: dict, tab_id: str) -> str:
+    """The lease key for an action.
+
+    DOM tools lease their element target. A WebMCP invocation leases the
+    tool handle in the tab (Stage E) -- there is no element target to own.
+    Every acquire/release site must use this helper so the keys match.
+    """
+    tool = action.get("tool", action.get("action", ""))
+    if tool == "webmcp_invoke":
+        return f"webmcp:{action.get('tool_name', '?')}@{tab_id}"
+    return str(action.get("target", action.get("selector",
+                   action.get("ref", "?"))))

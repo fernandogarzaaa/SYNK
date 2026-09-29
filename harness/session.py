@@ -336,6 +336,41 @@ class SessionManager:
                         return win.tabs[tab_id].identity(sid)
             return None
 
+    def frame_document_id(self, tab_id: str, frame_id: str = "main",
+                          session_id: str | None = None) -> str | None:
+        """Current document identity for a frame, or None if unknown.
+
+        Stage E: WebMCP handle scoping reads this at invoke time, so a
+        navigation (which replaces the document_id) is always detected.
+        """
+        with self._lock:
+            for sid, sess in self.sessions.items():
+                if session_id and sid != session_id:
+                    continue
+                for win in sess.windows.values():
+                    tab = win.tabs.get(tab_id)
+                    if tab is not None:
+                        frame = tab.frames.get(frame_id or "main")
+                        return frame.document_id if frame else None
+            return None
+
+    def frame_known(self, tab_id: str, frame_id: str = "main",
+                    session_id: str | None = None) -> bool:
+        """True when the frame is registered on the tab.
+
+        Stage E: scope_for_tab fails closed on unknown frames -- a
+        handle must never be minted for a frame the session never saw.
+        """
+        with self._lock:
+            for sid, sess in self.sessions.items():
+                if session_id and sid != session_id:
+                    continue
+                for win in sess.windows.values():
+                    tab = win.tabs.get(tab_id)
+                    if tab is not None:
+                        return (frame_id or "main") in tab.frames
+            return False
+
     def snapshot(self) -> dict:
         with self._lock:
             return {"runtime_id": self.runtime_id,

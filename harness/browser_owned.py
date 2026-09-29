@@ -42,7 +42,7 @@ from .browser_runtime import (BrowserAck, BrowserObservation, BrowserRuntime,
                               UnsupportedOperation, observation_id_for)
 from .interactions import (INTERACTION_JS, ack_for_observation,
                            ack_not_executed)
-from .session import MAIN_FRAME, new_id
+from .session import MAIN_FRAME
 
 DEFAULT_PROFILE_ROOT = os.path.expanduser("~/.synk/profiles")
 DEFAULT_PROFILE_DIR = os.path.join(DEFAULT_PROFILE_ROOT, "default")
@@ -645,6 +645,27 @@ class OwnedBrowserRuntime(BrowserRuntime):
         nodes = self._run(page.evaluate(_SNAPSHOT_JS), timeout=30)
         return {"url": page.url, "title": self._run(page.title(), timeout=10),
                 "nodes": nodes if isinstance(nodes, list) else []}
+
+    def evaluate_js(self, tab_id: str, frame_id: str,
+                    expression: str, arg: Any = None) -> Any:
+        """Evaluate a JS expression in one frame of an owned tab.
+
+        Stage E: this is the function the WebMCP CDP transport calls to
+        probe ``navigator.modelContext`` inside the live page. Frame
+        resolution reuses the fail-closed ``_frame_for`` walk: an unknown
+        tab, an unknown frame, or a disconnected browser raises (TabGone
+        / FrameGone / RuntimeError) instead of guessing. ``expression``
+        must be a self-contained function body or expression; ``arg`` is
+        passed through to Playwright's ``evaluate(expression, arg)``.
+        """
+        target = ElementTarget(session_id=self._session_id,
+                               window_id=self._window_id, tab_id=tab_id,
+                               frame_id=frame_id or MAIN_FRAME,
+                               frame_chain=([MAIN_FRAME] if not frame_id
+                                            or frame_id == MAIN_FRAME
+                                            else [MAIN_FRAME, frame_id]))
+        frame = self._frame_for(tab_id, target)
+        return self._run(frame.evaluate(expression, arg), timeout=30)
 
     # -- target resolution ----------------------------------------------------------
     def _frame_for(self, tab_id: str, target: ElementTarget):

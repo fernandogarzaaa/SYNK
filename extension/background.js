@@ -45,13 +45,71 @@ async function capture(tabId, windowId, goal = "", extra = {}) {
     { type: "CAPTURE", goal });
   const view = await harness("/snapshot", {
     url: snap.url, nodes: snap.nodes, goal,
+    // Stage E: page-reported model-context tools ride with the snapshot
+    // so the harness gateway discovers them per document generation.
+    // A missing webmcp block means the page reported nothing: the
+    // gateway treats that as no advertised tools, never as fallback.
+    webmcp: snap.webmcp || null,
     tab_id: String(tabId), window_id: String(windowId),
     frame_id: "main", ...extra,
   });
   return { snap, view };
 }
 
+async function executeWebMCP(tabId, action) {
+  // Stage E: invoke a page-advertised model-context tool. Broadcast to
+  // every content-script frame; exactly one frame (FRAME_ID match)
+  // performs the invocation and replies with the page's own tool report.
+  // The record is normalized into the ack shape the loop expects, but
+  // executed=true here means "the page's tool reported ok=true" -- the
+  // harness verifier judges that report as evidence, never our word.
+  let raw;
+  try {
+    raw = await chrome.tabs.sendMessage(Number(tabId), {
+      type: "WEBMCP_INVOKE",
+      tool_name: action.tool_name,
+      args: action.args || {},
+      target: { frame_id: action.frame_id || "main" },
+      action_id: action.action_id,
+    });
+  } catch (e) {
+    return { ack: true, action_id: action.action_id || null,
+      command: "webmcp_invoke", accepted: false, executed: false,
+      observed: null, error: `content script: ${e.message}`,
+      error_code: "FRAME_GONE", tab_id: String(tabId),
+      window_id: null, frame_id: action.frame_id || "main",
+      webmcp_result: null };
+  }
+  if (!raw || raw.tool !== action.tool_name) {
+    // No frame replied, or the reply names the wrong tool: fail closed.
+    return { ack: true, action_id: action.action_id || null,
+      command: "webmcp_invoke", accepted: false, executed: false,
+      observed: null,
+      error: "no webmcp tool report from content script " +
+             "(frame gone or tool mismatch)",
+      error_code: "FRAME_GONE", tab_id: String(tabId),
+      window_id: null, frame_id: action.frame_id || "main",
+      webmcp_result: null };
+  }
+  return { ack: true,
+    ack_id: raw.ack_id || null,
+    action_id: action.action_id || null,
+    command: "webmcp_invoke",
+    accepted: raw.error_code !== "WEBMCP_TOOL_NOT_ADVERTISED",
+    executed: raw.ok === true,
+    observed: raw.ok === true ? { webmcp_tool: raw.tool } : null,
+    error: raw.error || null,
+    error_code: raw.error_code || null,
+    tab_id: raw.tab_id || String(tabId),
+    window_id: raw.window_id || null,
+    frame_id: raw.frame_id || action.frame_id || "main",
+    webmcp_result: raw };
+}
+
 async function executeOnPage(tabId, action) {
+  if (action.tool === "webmcp_invoke") {
+    return executeWebMCP(tabId, action);
+  }
   // Stage D: one mutation on the pinned tab, with explicit frame targeting.
   // EXECUTE is broadcast to every content-script frame in the tab; exactly
   // one frame (the one whose FRAME_ID matches target.frame_id) performs the
@@ -216,12 +274,25 @@ async function runTask(goal, opts = {}) {
       // /agent/report can record the browser acknowledgement as evidence
       // BEFORE the verifier judges the post-action snapshot. Status is
       // "executed" only when the browser ack says executed===true.
+      // Stage E: a webmcp_invoke forwards the page's own tool report
+      // instead; the harness records it as WEBMCP_RESULT evidence and
+      // verifies the webmcp_result postcondition against it.
+      let reportExtra;
+      if (action.tool === "webmcp_invoke") {
+        reportExtra = ack.executed
+          ? { webmcp_result: ack.webmcp_result }
+          : { reason: ack.error || "unknown webmcp error",
+              error_code: ack.error_code,
+              webmcp_result: ack.webmcp_result };
+      } else {
+        reportExtra = ack.executed ? { browser_ack: ack }
+          : { reason: ack.error || "unknown browser error",
+              error_code: ack.error_code, browser_ack: ack };
+      }
       const report = await tryReport(
         taskId, next.action_id, next.claim_id,
         ack.executed ? "executed" : "browser_failed",
-        ack.executed ? { browser_ack: ack }
-                     : { reason: ack.error || "unknown browser error",
-                         error_code: ack.error_code, browser_ack: ack });
+        reportExtra);
       note("report", { decision: report?.decision, reason: report?.reason,
                        verification: report?.verification?.result,
                        verified: report?.verified,

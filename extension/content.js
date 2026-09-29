@@ -361,16 +361,117 @@
     return nodes;
   }
 
+  // ------------------------------------------------------------------
+  // Stage E: WebMCP model-context support.
+  //
+  // Real discovery of the page's model context, probed per page load.
+  // The probe reads the browser-exposed navigator.modelContext API, which
+  // IS visible from the content-script isolated world when the browser
+  // implements it (like navigator.geolocation). A page-script polyfill in
+  // the main JS world is NOT visible across the isolated-world boundary;
+  // discovery honestly reports only what this script can actually invoke.
+  // When the API is absent we report available:false -- never an empty
+  // success, never a guessed tool list.
+  // ------------------------------------------------------------------
+  async function probeModelContext() {
+    const mc = (typeof navigator !== "undefined" && navigator)
+               ? navigator.modelContext : undefined;
+    if (!mc) {
+      return { available: false, tools: [],
+               unavailable_reason: "webmcp_unavailable" };
+    }
+    let raw = [];
+    try {
+      // availableTools may be sync or async; await handles both.
+      if (typeof mc.availableTools === "function") raw = await mc.availableTools();
+      else if (Array.isArray(mc.tools)) raw = mc.tools;
+    } catch (e) {
+      return { available: false, tools: [],
+               unavailable_reason: "probe failed: " + String((e && e.message) || e) };
+    }
+    // Declarative fallback: script[type="webmcp-tool"] blocks.
+    try {
+      document.querySelectorAll('script[type="webmcp-tool"]').forEach((s) => {
+        try {
+          const t = JSON.parse(s.textContent || "{}");
+          if (t && t.name) raw.push(t);
+        } catch { /* malformed block: skip, fail closed per tool */ }
+      });
+    } catch { /* querySelector unavailable: skip */ }
+    const tools = [];
+    const seen = new Set();
+    for (const t of (Array.isArray(raw) ? raw : [])) {
+      if (!t || typeof t.name !== "string" || !t.name || seen.has(t.name)) continue;
+      seen.add(t.name);
+      tools.push({ name: t.name,
+                   description: typeof t.description === "string" ? t.description : "",
+                   schema: (t.schema && typeof t.schema === "object") ? t.schema : {},
+                   risk: t.risk || "low" });
+    }
+    return { available: true, tools };
+  }
+
+  // Honest invocation through the page's model context. Only called for a
+  // tool the probe advertised; unknown names fail closed here too.
+  async function doWebMCPInvoke(toolName, args = {}, action_id = null) {
+    const rec = {
+      ok: false, tool: toolName, action_id: action_id || null,
+      result: null, error: null, error_code: null, ...identity(),
+    };
+    const probe = await probeModelContext();
+    if (!probe.available) {
+      rec.error = "webmcp_unavailable: page exposes no model context";
+      rec.error_code = "WEBMCP_UNAVAILABLE";
+      return rec;
+    }
+    if (!probe.tools.some((t) => t.name === toolName)) {
+      rec.error = `webmcp tool not advertised by page: ${toolName}`;
+      rec.error_code = "WEBMCP_TOOL_NOT_ADVERTISED";
+      return rec;
+    }
+    const mc = navigator.modelContext;
+    if (typeof mc.invokeTool !== "function") {
+      rec.error = "webmcp_unavailable: model context has no invokeTool";
+      rec.error_code = "WEBMCP_UNAVAILABLE";
+      return rec;
+    }
+    try {
+      const timeout = new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("webmcp invoke timed out")), 30000));
+      const result = await Promise.race(
+        [Promise.resolve(mc.invokeTool(toolName, args || {})), timeout]);
+      if (result && result.ok === false) {
+        rec.error = result.error || "tool reported failure";
+        rec.error_code = "ACTION_FAILED";
+        rec.result = result.result !== undefined ? result.result : null;
+        return rec;
+      }
+      rec.ok = true;
+      rec.result = (result && result.result !== undefined)
+                   ? result.result : (result === undefined ? null : result);
+      return rec;
+    } catch (e) {
+      rec.error = String((e && e.message) || e);
+      rec.error_code = "ACTION_FAILED";
+      return rec;
+    }
+  }
+
   async function pushSnapshot(goal = "") {
     const now = Date.now();
     if (now - lastSent < 800) return; // throttle
     lastSent = now;
     const nodes = captureNodes();
+    // Stage E: page-reported model-context tools ride with the snapshot
+    // so the harness gateway discovers them per document generation.
+    let webmcp = null;
+    try { webmcp = await probeModelContext(); } catch { webmcp = null; }
     try {
       await fetch(`${HARNESS}/snapshot`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: location.href, nodes, goal, ...identity() }),
+        body: JSON.stringify({ url: location.href, nodes, goal,
+                               webmcp, ...identity() }),
       });
     } catch { /* harness offline: sidebar still works */ }
   }
@@ -531,9 +632,10 @@
     }
   }).observe(document.documentElement, { childList: true, subtree: true });
 
-  chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+  chrome.runtime.onMessage.addListener(async (msg, _sender, reply) => {
     if (msg.type === "CAPTURE") {
-      reply({ url: location.href, nodes: captureNodes(), ...identity() });
+      reply({ url: location.href, nodes: captureNodes(),
+              webmcp: await probeModelContext(), ...identity() });
       pushSnapshot(msg.goal || "");
       return true;
     }
@@ -550,6 +652,23 @@
       // Beta: purple = agent-owned target, blue = human-owned region.
       reply({ ok: highlight(msg.selector, 2500, msg.color || "#7c3aed") });
       return true;
+    }
+    // Stage E: WebMCP closed-loop path. Discovery reports the page's real
+    // model-context tools (or honest unavailability); invocation runs only
+    // in the target frame (single-responder broadcast, like EXECUTE).
+    if (msg.type === "WEBMCP_DISCOVER") {
+      reply({ ...await probeModelContext(), ...identity() });
+      return true;
+    }
+    if (msg.type === "WEBMCP_INVOKE") {
+      const wantFrame = (msg.target && msg.target.frame_id) || "main";
+      if (wantFrame !== FRAME_ID) return false; // not our frame: silent
+      doWebMCPInvoke(msg.tool_name, msg.args || {},
+                     msg.action_id || null).then((rec) => {
+        pushSnapshot();
+        reply(rec);
+      });
+      return true; // async reply
     }
   });
 
