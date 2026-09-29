@@ -96,6 +96,9 @@ def fingerprint_of(node: dict, frame_id: str = MAIN_FRAME) -> dict:
     }
 
 
+from .contamination import classify_text, quarantine_id
+
+
 def fingerprint_diff(old_fp: dict, new_fp: dict) -> list[str]:
     """Human-readable list of fingerprint field changes (identity excluded)."""
     changes = []
@@ -117,7 +120,8 @@ def node_stable_key(node: dict) -> str:
 
 
 class ContextManager:
-    def __init__(self, max_nodes: int = MAX_NODES_DEFAULT):
+    def __init__(self, max_nodes: int = MAX_NODES_DEFAULT, emit=None):
+        self.emit = emit or (lambda t, d: None)
         self.max_nodes = max_nodes
         self.current: dict | None = None   # latest snapshot only (default tab)
         self.prev_hash = ""
@@ -142,6 +146,11 @@ class ContextManager:
         self._tab_versions[tab_id] = tab_version
         origin = canonical_origin(url)
         trimmed = trim_snapshot(nodes, self.max_nodes, goal)
+        # Stage F: instruction-injection quarantine. Page text is untrusted
+        # data; anything that looks like an instruction to the agent is
+        # replaced by a placeholder BEFORE prompt construction. The journal
+        # keeps quarantine ids and markers, never the hostile text.
+        quarantined = self._quarantine_injections(trimmed, url, tab_id)
         element_refs: dict[int, dict] = {}
         for n in trimmed:
             self._ref_counter += 1
@@ -200,7 +209,39 @@ class ContextManager:
             "snapshot_version": tab_version,
             "tab_id": tab_id, "session_id": session_id,
             "frame_id": frame_id,
+            "quarantined": quarantined,
         }
+
+    # -- injection quarantine ------------------------------------------------
+    _QUARANTINE_FIELDS = ("name", "value", "placeholder", "title",
+                          "aria-label", "text", "label")
+    _QUARANTINE_PLACEHOLDER = ("[QUARANTINED: instruction-like page text "
+                               "removed]")
+
+    def _quarantine_injections(self, nodes: list[dict], url: str,
+                               tab_id: str) -> list[dict]:
+        """Replace injection-bearing page strings with a placeholder.
+
+        Returns the quarantine reports (ids + markers, never raw hostile
+        text) and emits one ``security.quarantine`` event per field.
+        """
+        reports = []
+        for n in nodes:
+            for field in self._QUARANTINE_FIELDS:
+                val = n.get(field)
+                if not isinstance(val, str) or not val:
+                    continue
+                res = classify_text(val)
+                if not res["injection"]:
+                    continue
+                qid = quarantine_id(url, field, val)
+                n[field] = self._QUARANTINE_PLACEHOLDER
+                n.setdefault("_quarantine_ids", []).append(qid)
+                report = {"quarantine_id": qid, "url": url, "tab_id": tab_id,
+                          "field": field, "markers": res["markers"]}
+                reports.append(report)
+                self.emit("security.quarantine", report)
+        return reports
 
     # -- fingerprint diff ----------------------------------------------------
     @staticmethod

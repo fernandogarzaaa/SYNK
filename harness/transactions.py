@@ -231,7 +231,8 @@ class TransactionEngine:
 
     def __init__(self, world, ownership: OwnershipGraph,
                  leases: LeaseManager, tools, safety, ctx, verifier,
-                 emit: Callable[[str, dict], Any] | None = None):
+                 emit: Callable[[str, dict], Any] | None = None,
+                 policy=None, sessions=None):
         self.world = world
         self.ownership = ownership
         self.leases = leases
@@ -240,6 +241,12 @@ class TransactionEngine:
         self.ctx = ctx                # ContextManager (fail-closed refs)
         self.verifier = verifier      # the ONE global Verifier
         self.emit = emit or (lambda t, d: None)
+        # Stage F: per-origin execution policy (default-deny). A None
+        # policy builds an empty registry (every known origin fails
+        # closed; no-origin calls abstain to the legacy safety path).
+        from .policy import OriginPolicyRegistry
+        self.policy = policy or OriginPolicyRegistry(emit=self.emit)
+        self.sessions = sessions      # SessionManager (origin resolution)
 
     # -- public ------------------------------------------------------------------
     def prepare(self, action: dict, *, task_id: str,
@@ -436,7 +443,32 @@ class TransactionEngine:
             ex.error_code = STALE_REFERENCE
             ex.error = ref_err
             return True
-        ex.transition(VALIDATED, "schema + refs ok")
+
+        # POLICY (Stage F): per-origin policy decision BEFORE lease
+        # acquisition and dispatch. Unknown origins fail closed
+        # (POLICY_DENIED); an undeterminable origin abstains to the legacy
+        # safety path (unit tests with no page context).
+        from .policy import origin_of_url, POLICY_ABSTAIN
+        origin = origin_of_url(req.page_url)
+        if not origin and self.sessions is not None:
+            try:
+                origin = origin_of_url(
+                    self.sessions.tab_url(req.tab_id,
+                                          session_id=req.session_id) or "")
+            except Exception:
+                origin = ""
+        action_class = self.policy.action_class_for(tool)
+        decision = self.policy.check_action(
+            req.task_id, origin, action_class,
+            user_consented=req.user_consented, tool_name=tool)
+        self.safety.log(
+            action,
+            f"policy:{decision.error_code or 'allowed'}:{decision.reason}")
+        if decision.error_code != POLICY_ABSTAIN and not decision.allowed:
+            self._fail(ex, decision.error_code,
+                       f"policy: {decision.reason}")
+            return True
+        ex.transition(VALIDATED, "schema + refs + policy ok")
 
         # RESERVE: exclusive, hierarchy-aware lease (or adopt a pre-held one).
         lease = self._reserve(req)

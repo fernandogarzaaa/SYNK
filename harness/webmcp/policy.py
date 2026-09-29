@@ -25,9 +25,11 @@ class PolicyDecision:
 class PolicyEngine:
     """Evaluates whether a capability can be executed given current state."""
 
-    def __init__(self, ownership: OwnershipGraph, safety: SafetyLayer):
+    def __init__(self, ownership: OwnershipGraph, safety: SafetyLayer,
+                 leases: "LeaseManager | None" = None):
         self.ownership = ownership
         self.safety = safety
+        self.leases = leases
 
     def check(self, capability: Capability, goal: str = "",
               user_consented: bool = False, agent_lease: str | None = None) -> PolicyDecision:
@@ -68,10 +70,21 @@ class PolicyEngine:
         if not ok:
             return PolicyDecision(False, f"safety: {reason}", capability)
 
-        # 4. Lease check (if agent has a lease on this origin)
+        # 4. Lease check (when the caller presents the agent's held lease):
+        # the lease must still be live in the lease table. A stale,
+        # unknown, or foreign lease fails closed. Lease acquisition and
+        # release happen in the transaction engine around dispatch; this
+        # check catches dispatch that bypassed that path.
         if agent_lease:
-            # In a real impl, we'd verify the lease matches
-            pass
+            import time as _time
+            live = False
+            if self.leases is not None:
+                rec = self.leases.leases.get(agent_lease)
+                live = bool(rec) and rec.get("expires_at", 0) > _time.time()
+            if not live:
+                return PolicyDecision(
+                    False, f"lease {agent_lease} is not live",
+                    capability)
 
         return PolicyDecision(True, "allowed", capability)
 

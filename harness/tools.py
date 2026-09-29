@@ -216,7 +216,8 @@ class ToolExecutor:
                              task_id=action.get("task_id"),
                              action_id=action.get("action_id"),
                              user_consented=user_consented,
-                             goal=action.get("intent", ""))
+                             goal=action.get("intent", ""),
+                             agent_lease=action.get("lease"))
         res = inv.result
         # Evidence: the page's own tool report. Recorded even on failure
         # (ok=False results verify as FAILED, never as silent success).
