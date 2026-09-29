@@ -147,6 +147,10 @@ MODEL_CONTEXT_PROBE_JS = """(async () => {
 })()"""
 
 # Invoke through the page's model context. Playwright passes one arg object.
+# NOTE: this must be a FUNCTION EXPRESSION, not an IIFE: Playwright
+# calls the evaluated function with the arg object. An IIFE would run
+# with undefined args (found by live-browser verification; the fake
+# transport never evaluates this JS).
 MODEL_CONTEXT_INVOKE_JS = """(async ({ toolName, args }) => {
   try {
     const mc = (typeof navigator !== "undefined") ? navigator.modelContext : undefined;
@@ -158,7 +162,7 @@ MODEL_CONTEXT_INVOKE_JS = """(async ({ toolName, args }) => {
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   }
-})()"""
+})"""
 
 
 # -- transport interface ---------------------------------------------------------------

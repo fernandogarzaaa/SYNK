@@ -133,6 +133,9 @@ Final local verification (Stage H, run in full before the PR):
 |---|---|
 | `python -m unittest discover -s tests` | 325 tests, OK |
 | `python -m pytest tests/ -q` | 330 passed |
+| Live-browser gap verification (2026-09-29, real Chromium) | |
+| `python -m pytest tests/live/ -q` | 19 passed (owned launch, CDP attach, WebMCP, scheduler, unpacked extension) |
+| `SYNK_LIVE_BROWSER=0 python -m pytest tests/live/ -q` | 19 skipped, graceful (CI browserless path) |
 | `python -m compileall -q harness tests benchmark demo` | clean |
 | `node --check extension/content.js` | clean |
 | `node --check extension/background.js` | clean |
@@ -217,13 +220,42 @@ fail-closed outcome:
 
 Stated plainly; nothing here is presented as done:
 
-1. **No live browser was available in this environment.** The
-   extension content script, the Playwright/CDP adapter, the owned
-   launch/attach paths, crash/restart hooks, and the page
-   model-context WebMCP path are implemented and tested against a
-   deterministic fake backend (70 Stage D tests), but never against a
-   real Chrome/CDP session. Real-page verification rates and
-   interaction timings are UNMEASURED.
+1. **Live-browser gap closed (2026-09-29, PR "live browser
+   verification").** The paths below were exercised against a real
+   Chromium (Chrome for Testing 153.0.8010.12, Playwright-driven,
+   SYNK-owned profile; the harness never touches the user's browser)
+   and are covered by 19 tests in `tests/live/`, which skip gracefully
+   in browserless CI (`SYNK_LIVE_BROWSER=0` forces the skip):
+   - Owned Chromium launch: real typing, clicking, navigation,
+     snapshots, and acks through the transaction engine. Ack-only
+     evidence stays UNVERIFIED; fresh independent snapshot evidence
+     verifies; contradictory evidence stays UNVERIFIED.
+   - Explicit attach to an operator-started
+     `--remote-debugging-port=0` Chromium endpoint, with endpoint
+     discovery via `DevToolsActivePort`/`/json/version` and
+     fail-closed rejection of non-WebSocket endpoints.
+   - Live-page `navigator.modelContext` WebMCP: discovery of
+     advertised tools, deterministic selection, invocation, and
+     verification from the page-reported `WEBMCP_RESULT`; missing
+     model context and unadvertised tools fail closed.
+   - Sequential scheduler driving a real browser: completes only when
+     every action verifies against fresh evidence; one task per
+     `run_next()`; dispatched-but-unverified actions yield `failed`,
+     never `completed`.
+   - Unpacked extension: real snapshot push ingested by the harness
+     and live `value.changed` event reporting from the content script.
+   Live verification found and fixed three shipped bugs: an
+   owned-browser lifecycle deadlock (loop thread vs. lock), a
+   Playwright `evaluate()` multi-argument crash in the type/select
+   primitives, and an immediately-invoked WebMCP transport function
+   that never received its arguments; it also required CORS handling
+   on the loopback harness and an `ignore_default_args` option so the
+   unpacked extension is not disabled by Playwright defaults.
+   Still unmeasured: real-page verification rates and interaction
+   timings at scale, and crash/restart hooks against a real browser.
+   The WebMCP fixture page is scaffolding: it verifies the real
+   transport and runtime path, not interop with every external WebMCP
+   implementation.
 2. **Tauri shell: `cargo check` now run locally (2026-09-29).** A
    Rust toolchain was installed (rustc/cargo 1.98.1, stable) and
    `cargo check --locked` in `shell/src-tauri` passes with zero
@@ -287,26 +319,21 @@ Stated plainly; nothing here is presented as done:
 - The audit journal is hash-chained in memory; durable tamper-evidence
   across restarts depends on the operator persisting it.
 
-## 8. What a future operator must do to verify the live-browser path
+## 8. What a future operator must still do
 
-1. `pip install playwright && playwright install chromium`.
-2. Start the harness with `python -m harness.server --port 18080
-   --use-cdp` (owned-launch mode; never the user's browser).
-3. Drive the demo end to end and confirm actions reach VERIFIED
-   against real observations, not just the fake backend.
-4. Re-run `python benchmark/runner.py` and extend it with a
-   browser-attached throughput/verification-rate benchmark; label the
-   new numbers with the browser, version, and page set used.
-5. Load `extension/` unpacked in Chrome, run the closed loop
-   (`/agent/*`) against a real page, and confirm dishonest-ack
-   rejection still holds with the real content script.
-6. For WebMCP: serve a page that exposes a real model-context tool,
-   run `/webmcp/discover` + `/webmcp/invoke`, and confirm the
-   `webmcp_result` postcondition verifies from the page's own report.
-7. Package the Tauri shell (`npm run tauri build` with a Rust
+1. Re-run `python benchmark/runner.py` with a browser-attached
+   throughput/verification-rate benchmark; label the new numbers with
+   the browser, version, and page set used. (Real-page verification
+   rates and interaction timings remain UNMEASURED.)
+2. Exercise crash/restart hooks against a real browser session.
+3. Package the Tauri shell (`npm run tauri build` with a Rust
    toolchain) and smoke-test the five commands against a running
    harness before calling the shell anything stronger than
    EXPERIMENTAL.
+4. For WebMCP interop beyond the fixture page: point
+   `/webmcp/discover` + `/webmcp/invoke` at a real third-party
+   model-context implementation and confirm the `webmcp_result`
+   postcondition still verifies from the page's own report.
 
 ## 9. Completion statement
 

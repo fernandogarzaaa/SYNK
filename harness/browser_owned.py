@@ -222,6 +222,8 @@ class OwnedBrowserRuntime(BrowserRuntime):
         self._profile_dir: str | None = None
         self._ws_endpoint: str | None = None
         self._headless = True
+        self._extra_args: list = []
+        self._ignore_default_args: list = []
         self._session_id = session_id or "default_session"
         self._window_id = window_id or "win_default"
         self._connected = False
@@ -248,16 +250,30 @@ class OwnedBrowserRuntime(BrowserRuntime):
     def launch(cls, profile_dir: str | None = None,
                headless: bool = True,
                session_id: str | None = None,
-               window_id: str | None = None) -> "OwnedBrowserRuntime":
+               window_id: str | None = None,
+               extra_args: list[str] | None = None,
+               ignore_default_args: list[str] | None = None,
+               ) -> "OwnedBrowserRuntime":
         """Launch a SYNK-MANAGED Chromium with a persistent SYNK profile.
 
         This is never the user's browser: the profile directory is owned
         by SYNK (default ~/.synk/profiles/default). No user data is read.
+
+        ``extra_args`` passes additional Chromium flags (e.g.
+        ``["--no-sandbox", "--disable-dev-shm-usage"]`` for containerized
+        operators running as root). Flags are appended after Playwright's
+        defaults; SYNK never launches the user's own browser either way.
+
+        ``ignore_default_args`` removes Playwright default flags, e.g.
+        ``["--disable-extensions"]`` when the operator intentionally loads
+        an unpacked extension via ``--load-extension`` for testing.
         """
         rt = cls(session_id=session_id, window_id=window_id)
         rt._mode = "owned-launch"
         rt._profile_dir = profile_dir or DEFAULT_PROFILE_DIR
+        rt._ignore_default_args = list(ignore_default_args or [])
         rt._headless = headless
+        rt._extra_args = list(extra_args or [])
         return rt
 
     @classmethod
@@ -291,6 +307,12 @@ class OwnedBrowserRuntime(BrowserRuntime):
     def connect(self) -> dict:
         if not _require_playwright():
             raise _playwright_missing_error()
+        # NOTE: the lock is NEVER held across self._run(...): the
+        # coroutine runs on the loop thread and _connect_async adopts
+        # pages via _adopt_page(), which takes the same lock. Holding it
+        # here would deadlock the loop thread against this one. (Found
+        # by live-browser verification; the fake backend never adopts
+        # real pages, so the deadlock was invisible in unit tests.)
         with self._lock:
             if self._mode is None:
                 raise ValueError(
@@ -303,12 +325,21 @@ class OwnedBrowserRuntime(BrowserRuntime):
             self._thread = threading.Thread(target=self._pump,
                                             daemon=True,
                                             name="synk-playwright")
+            my_loop, my_thread = self._loop, self._thread
             self._thread.start()
-            try:
-                self._run(self._connect_async(), timeout=60)
-            except Exception:
-                self._shutdown_loop()
-                raise
+        try:
+            self._run(self._connect_async(), timeout=60)
+        except Exception:
+            # Tear down only our own failed incarnation; a concurrent
+            # connect() may have replaced self._loop/_thread already.
+            with self._lock:
+                if self._loop is my_loop:
+                    self._loop = None
+                if self._thread is my_thread:
+                    self._thread = None
+            self._stop_pair(my_loop, my_thread)
+            raise
+        with self._lock:
             self._connected = True
             self._crashed = False
             return {"mode": self._mode,
@@ -317,14 +348,29 @@ class OwnedBrowserRuntime(BrowserRuntime):
                     "tabs": len(self._pages)}
 
     def disconnect(self) -> None:
+        # Same no-lock-across-_run rule as connect(): the disconnect
+        # coroutine runs on the loop thread, so the lock must not be held
+        # while awaiting it.
         with self._lock:
-            if self._loop and self._connected:
-                try:
-                    self._run(self._disconnect_async(), timeout=15)
-                except Exception:
-                    pass
+            loop, thread, connected = self._loop, self._thread, self._connected
+        if loop and connected:
+            try:
+                self._run(self._disconnect_async(), timeout=15)
+            except Exception:
+                pass
+        with self._lock:
             self._connected = False
-            self._shutdown_loop()
+            # Clear only the incarnation we disconnected; a concurrent
+            # connect() may have started a newer loop/thread already.
+            if self._loop is loop:
+                self._loop = None
+            else:
+                loop = None
+            if self._thread is thread:
+                self._thread = None
+            else:
+                thread = None
+        self._stop_pair(loop, thread)
 
     def restart(self) -> dict:
         """Relaunch the SYNK-owned browser and re-adopt its tabs.
@@ -352,16 +398,20 @@ class OwnedBrowserRuntime(BrowserRuntime):
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    def _shutdown_loop(self):
-        loop, self._loop = self._loop, None
+    @staticmethod
+    def _stop_pair(loop, thread) -> None:
+        """Stop a specific loop/thread incarnation (no lock needed).
+
+        Takes the exact objects to tear down so a concurrent connect()
+        that already started a newer incarnation is never disturbed.
+        """
         if loop is not None:
             try:
                 loop.call_soon_threadsafe(loop.stop)
             except Exception:
                 pass
-        th, self._thread = self._thread, None
-        if th is not None and th is not threading.current_thread():
-            th.join(timeout=5)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
 
     def _run(self, coro, timeout: float = 30):
         if self._loop is None:
@@ -377,7 +427,8 @@ class OwnedBrowserRuntime(BrowserRuntime):
             os.makedirs(self._profile_dir, exist_ok=True)
             self._context = await self._pw.chromium.launch_persistent_context(
                 self._profile_dir, headless=self._headless,
-                accept_downloads=True)
+                accept_downloads=True, args=list(self._extra_args),
+                ignore_default_args=list(self._ignore_default_args))
             # launch_persistent_context has no separate Browser object.
             self._browser = self._context.browser
         else:  # attached-endpoint
@@ -600,7 +651,8 @@ class OwnedBrowserRuntime(BrowserRuntime):
         if self._mode == "owned-launch":
             self._context = await self._pw.chromium.launch_persistent_context(
                 self._profile_dir, headless=self._headless,
-                accept_downloads=True)
+                accept_downloads=True, args=list(self._extra_args),
+                ignore_default_args=list(self._ignore_default_args))
         else:
             self._context = await self._browser.new_context(
                 accept_downloads=True)
@@ -840,23 +892,25 @@ class OwnedBrowserRuntime(BrowserRuntime):
         await frame.evaluate(INTERACTION_JS)
         if shadow_spec is not None:
             res = await frame.evaluate(
-                "(spec, text, clearFirst) => {"
+                "({spec, text, clearFirst}) => {"
                 " const r = window.__synk.resolveTarget(spec);"
                 " return r.ok ? window.__synk.robustType(r.el, text,"
                 " {clearFirst}) : r; }",
-                {"shadowPath": list(target.shadow_path),
-                 "locator": dict(target.locator)}, text, clear_first)
+                {"spec": {"shadowPath": list(target.shadow_path),
+                          "locator": dict(target.locator)},
+                 "text": text, "clearFirst": clear_first})
         else:
             # Scope the primitive to the single resolved element without
             # re-querying by selector (no TOCTOU between resolve and act).
             res = await frame.evaluate(
-                "(sel, text, clearFirst) => {"
+                "({sel, text, clearFirst}) => {"
                 " const els = document.querySelectorAll(sel);"
                 " if (els.length !== 1) return {ok:false,"
                 "  error:'element changed between resolve and act'};"
                 " return window.__synk.robustType(els[0], text,"
                 " {clearFirst}); }",
-                target.locator.get("value"), text, clear_first)
+                {"sel": target.locator.get("value"), "text": text,
+                 "clearFirst": clear_first})
         if not res.get("ok"):
             raise RuntimeError(res.get("error", "type failed"))
         return res.get("observed", {})
@@ -872,20 +926,21 @@ class OwnedBrowserRuntime(BrowserRuntime):
         await frame.evaluate(INTERACTION_JS)
         if shadow_spec is not None:
             res = await frame.evaluate(
-                "(spec, value) => { const r = window.__synk.resolveTarget(spec);"
+                "({spec, value}) => { const r = window.__synk.resolveTarget(spec);"
                 " return r.ok ? window.__synk.robustSelect(r.el, value) : r; }",
-                {"shadowPath": list(target.shadow_path),
-                 "locator": dict(target.locator)}, value)
+                {"spec": {"shadowPath": list(target.shadow_path),
+                          "locator": dict(target.locator)},
+                 "value": value})
         else:
             chosen = await pl.select_option(value=value, timeout=15000)
             if not chosen:
                 # Fall back to visible-text match via the robust primitive.
                 res = await frame.evaluate(
-                    "(sel, value) => { const els = document.querySelectorAll(sel);"
+                    "({sel, value}) => { const els = document.querySelectorAll(sel);"
                     " if (els.length !== 1) return {ok:false,"
                     "  error:'element changed between resolve and act'};"
                     " return window.__synk.robustSelect(els[0], value); }",
-                    target.locator.get("value"), value)
+                    {"sel": target.locator.get("value"), "value": value})
                 if not res.get("ok"):
                     raise RuntimeError(res.get("error",
                                                "option not found: " + value))
