@@ -361,6 +361,10 @@ class TestServerWiring(unittest.TestCase):
         tools = Tools()
         from harness.safety import SafetyLayer
         tx = TransactionRunner(WorldState(), og, lm, tools, SafetyLayer())
+        # Stage F: default-deny policy requires the test origin registered.
+        tx.engine.policy.register_origin(
+            "x.com", allow=["read", "navigate", "interact"],
+            description="stage B test origin")
         res = tx.run({"tool": "click", "target": "#b", "tab_id": "t9"},
                      "https://x.com", tab_id="t9")
         self.assertEqual(res["verdict"], "executed")

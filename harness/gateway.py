@@ -83,7 +83,9 @@ class ExecutionGateway:
             page_url=page_url, user_consented=consented, strict=True)
 
         # Memory learning + recording (moved here from the endpoint
-        # handlers so every caller learns identically).
+        # handlers so every caller learns identically). Stage F: records
+        # are task-scoped and session-isolated; secrets are redacted
+        # before storage and the journal gets a content hash, not content.
         if self.mem is not None:
             note = request.get("note", "")
             for a, ex in zip(actions, report.executions):
@@ -91,7 +93,9 @@ class ExecutionGateway:
                     try:
                         self.mem.learn_from_action(a)
                         self.mem.record(page_url, a,
-                                        json.dumps(ex.to_dict())[:500], note)
+                                        json.dumps(ex.to_dict())[:500], note,
+                                        session_id=request.get("session_id"),
+                                        task_id=task_id, scope="task")
                     except Exception:
                         pass
 

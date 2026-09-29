@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
@@ -95,8 +96,6 @@ class State:
                  cdp_endpoint: str = "", profile_dir: str = "",
                  webmcp_fallback: bool = False):
         self.safety = SafetyLayer(SafetyConfig())
-        self.ctx = ContextManager()
-        self.mem = MemoryStore(db_path)
         # Stage D browser modes (exactly one):
         #   default            attached-extension: the user's own browser,
         #                      driven only via extension snapshots + the
@@ -128,6 +127,10 @@ class State:
 
         # Beta runtime: world + bus + ownership + transactions + learning
         self.bus = EventBus()
+        # Stage F: memory and context-manager journal events flow through
+        # the bus (memory.read/stored/deleted, security.quarantine).
+        self.ctx = ContextManager(emit=self.bus.emit)
+        self.mem = MemoryStore(db_path, emit=self.bus.emit)
         self.world = WorldState()
         self.sessions = SessionManager()
         self.ownership = OwnershipGraph()
@@ -162,12 +165,13 @@ class State:
         # SYNK_WEBMCP_FALLBACK=1); default is fail closed.
         self._webmcp_fallback_opt_in = bool(
             webmcp_fallback or
-            __import__("os").environ.get("SYNK_WEBMCP_FALLBACK"))
+            os.environ.get("SYNK_WEBMCP_FALLBACK"))
         self.webmcp_gateway = WebMCPGateway(
             transport=ExtensionSnapshotTransport(
                 lambda scope_key: snapshots.get(scope_key)),
             sessions=self.sessions,
-            policy_engine=PolicyEngine(self.ownership, self.safety),
+            policy_engine=PolicyEngine(self.ownership, self.safety,
+                                       leases=self.leases),
             allow_fallback=self._webmcp_fallback_opt_in,
             emit=self.bus.emit)
         self.tools.webmcp_gateway = self.webmcp_gateway
@@ -185,9 +189,22 @@ class State:
         from .transactions import TransactionEngine
         from .gateway import ExecutionGateway
         from .orchestrator import AgentLoop
+        # Stage F: per-origin execution policy (default-deny). Unknown
+        # origins fail closed at the transaction engine's VALIDATE stage,
+        # before any lease or dispatch. Operators register origins via
+        # POST /policy/origin.
+        from .policy import OriginPolicyRegistry
+        self.policy = OriginPolicyRegistry()
         self.engine = TransactionEngine(self.world, self.ownership,
                                         self.leases, self.tools, self.safety,
-                                        self.ctx, self.verifier)
+                                        self.ctx, self.verifier,
+                                        emit=self.bus.emit,
+                                        policy=self.policy,
+                                        sessions=self.sessions)
+        self.policy.emit = self.bus.emit
+        # Stage F: memory stores/deletions are journaled (hashes, not
+        # content) through the event bus.
+        self.mem.emit = self.bus.emit
         self.gateway = ExecutionGateway(self.engine, mem=self.mem,
                                         emit=self.bus.emit)
         self.agent = AgentLoop(self, self.llm)
@@ -325,9 +342,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "service": "ai-cowork-harness",
                                     "version": "0.2-beta"})
         if path == "/memory":
-            return self._send(200, {"summary": STATE.mem.summary_for_prompt(),
+            from urllib.parse import parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            sid = (q.get("session_id") or [None])[0]
+            return self._send(200, {"summary":
+                                    STATE.mem.summary_for_prompt(
+                                        session_id=sid),
                                     "prefs": STATE.mem.all_prefs(),
-                                    "recent": STATE.mem.recent(10)})
+                                    "recent": STATE.mem.recent(
+                                        10, session_id=sid)})
         if path == "/audit":
             return self._send(200, {"trail": STATE.safety.audit_trail(),
                                     "chain_valid": STATE.safety.verify_chain()})
@@ -340,6 +363,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"levels": STATE.ladder.describe()})
         if path == "/workflows":
             return self._send(200, {"workflows": STATE.wfmem.all_workflows()})
+        # Stage F: origin policy registry (default-deny). Operators must
+        # register an origin before the agent may act on it.
+        if path == "/policy":
+            return self._send(200, {"ok": True,
+                                    "origins": STATE.policy.snapshot()})
         # Beta.1: WebMCP GET = list-only, no body (query params allowed)
         if path == "/webmcp/capabilities":
             from urllib.parse import parse_qs
@@ -391,6 +419,38 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/memory/forget":
             STATE.mem.forget_all()
             return self._send(200, {"ok": True, "forgotten": True})
+        # Stage F: verified deletion of one record, or of a whole session.
+        if path == "/memory/delete":
+            try:
+                rid = int(b.get("record_id", -1))
+            except (TypeError, ValueError):
+                return self._send(400, {"ok": False, "error":
+                                        "invalid_record_id"})
+            ok = STATE.mem.delete_record(rid, b.get("session_id"))
+            return self._send(200, {"ok": ok, "deleted": ok})
+        if path == "/memory/forget_session":
+            n = STATE.mem.forget_session(b.get("session_id", ""))
+            return self._send(200, {"ok": True, "deleted": n})
+        # Stage F: origin policy management (operator trust decisions).
+        if path == "/policy/origin":
+            try:
+                pol = STATE.policy.register_origin(
+                    b.get("origin", ""),
+                    allow=b.get("allow", []), deny=b.get("deny", []),
+                    require_consent=b.get("require_consent", []),
+                    min_trust=b.get("min_trust", "page-advertised"),
+                    description=b.get("description", ""))
+            except (ValueError, TypeError) as e:
+                # Typed HTTP 400, never a leaked traceback.
+                return self._send(400, {"ok": False, "error": "invalid_origin",
+                                        "detail": str(e)})
+            return self._send(200, {"ok": True, "origin": pol.origin,
+                                    "policy_id": pol.policy_id(),
+                                    "policy": STATE.policy.snapshot()
+                                    [pol.origin]})
+        if path == "/policy/origin/remove":
+            removed = STATE.policy.remove_origin(b.get("origin", ""))
+            return self._send(200, {"ok": removed, "removed": removed})
         if path == "/workflow/observe":
             return self._workflow_observe(b)
         if path == "/workflow/suggest":
@@ -550,7 +610,22 @@ class Handler(BaseHTTPRequestHandler):
             n.setdefault("index", i)
             n.setdefault("frame_id", frame_id)
         flat = json.dumps(nodes)[:20000]
-        injected = STATE.safety.detect_injection(flat)
+        # Stage F: page text is untrusted data. Deterministic injection
+        # scan; hits are quarantined (flagged + journaled), never treated
+        # as instructions.
+        from .contamination import classify_text, quarantine_id
+        inj = classify_text(flat)
+        injected = inj["injection"]
+        if injected:
+            qid = quarantine_id(sess.session_id, tab_id, frame_id,
+                                inj["markers"][0] if inj["markers"] else "")
+            STATE.bus.emit("security.quarantine",
+                           {"quarantine_id": qid, "kind": "page_text",
+                            "session_id": sess.session_id, "tab_id": tab_id,
+                            "frame_id": frame_id, "url": url,
+                            "markers": inj["markers"]})
+            STATE.safety.log({"tool": "snapshot", "url": url},
+                             f"quarantined:page_text:{qid}")
         view = STATE.ctx.ingest(url, nodes, b.get("goal", ""),
                                 b.get("screenshot_note", ""),
                                 session_id=sess.session_id, tab_id=tab_id,
@@ -1074,6 +1149,11 @@ def _run_benchmarks() -> dict:
         lm = LM(og)
         w = WS()
         tx = TR(w, og, lm, TE(SL()), SL())
+        # Stage F: the synthetic benchmark origin is explicitly trusted so
+        # the run exercises conflict avoidance, not policy default-deny.
+        tx.engine.policy.register_origin(
+            "bench.shop", allow=["read", "navigate", "interact"],
+            description="synthetic benchmark origin")
         og.mark_human("#pay")  # human is on the pay button
         r = tx.run({"tool": "click", "target": "#pay"}, "https://bench.shop/pay")
         avoided = (not r.get("ok")) and r.get("verdict") in ("replan", "request_ownership")

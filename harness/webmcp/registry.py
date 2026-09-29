@@ -29,13 +29,20 @@ class Capability:
     annotations: ToolAnnotation = field(default_factory=ToolAnnotation)
     schema: dict[str, Any] = field(default_factory=dict)
     description: str = ""
+    # Stage F privilege model: how much the harness trusts the
+    # advertisement, and which principal (session) discovered it. A
+    # capability can only be invoked by the principal that discovered it.
+    trust_level: str = "page-advertised"
+    discovered_by: str | None = None
     # execution metadata
     last_used: float = 0.0
     success_count: int = 0
     failure_count: int = 0
 
     @classmethod
-    def from_webmcp(cls, origin: str, tool: WebMCPTool) -> "Capability":
+    def from_webmcp(cls, origin: str, tool: WebMCPTool,
+                    discovered_by: str | None = None,
+                    trust_level: str = "page-advertised") -> "Capability":
         risk = "low"
         if tool.is_destructive:
             risk = "critical"
@@ -55,6 +62,8 @@ class Capability:
             annotations=tool.annotations,
             schema=tool.input_schema,
             description=tool.description,
+            trust_level=trust_level,
+            discovered_by=discovered_by,
         )
 
     @classmethod

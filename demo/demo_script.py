@@ -30,6 +30,12 @@ nodes = [  # what content.js would capture from sample_page.html
      "selector": "footer"},
 ]
 
+print("== register origin (Stage F: default-deny policy) ==")
+reg = post("/policy/origin", {"origin": "demo.shop",
+                              "allow": ["read", "navigate", "interact"],
+                              "description": "demo shop"})
+print(json.dumps(reg, indent=1)[:400], "\n")
+
 print("== snapshot ==")
 view = post("/snapshot", {"url": "https://demo.shop/checkout",
                           "nodes": nodes, "goal": "Fill the checkout form"})

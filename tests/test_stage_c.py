@@ -59,6 +59,11 @@ class Harness:
         self.engine = TransactionEngine(
             self.world, self.ownership, self.leases, self.tools,
             self.safety, self.ctx, self.verifier)
+        # Stage F: the test origin is explicitly trusted (default-deny
+        # would otherwise fail every action closed).
+        self.engine.policy.register_origin(
+            "shop.com", allow=["read", "navigate", "interact", "webmcp"],
+            description="stage C test origin")
 
     def ingest(self, tab_id="t1", url="https://shop.com"):
         view = self.ctx.ingest(url, shop_nodes(), "", tab_id=tab_id)
@@ -382,6 +387,10 @@ class TestGateway(unittest.TestCase):
                 return {"ok": True, "command": action.get("tool")}
 
         tx = TransactionRunner(world, ownership, leases, T(), SafetyLayer())
+        # Stage F: default-deny policy requires the test origin registered.
+        tx.engine.policy.register_origin(
+            "x.com", allow=["read", "navigate", "interact"],
+            description="stage C test origin")
         r = tx.run({"tool": "click", "target": "#b", "tab_id": "t9"},
                    "https://x.com", tab_id="t9")
         self.assertEqual(r["verdict"], "executed")

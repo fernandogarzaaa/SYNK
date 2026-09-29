@@ -921,6 +921,10 @@ class TestMultiTabPrompt(unittest.TestCase):
         second tab's elements."""
         from harness.server import State
         s = State(":memory:")
+        # Stage F: the task's origin must be registered (default-deny).
+        s.policy.register_origin(
+            "b.example", allow=["read", "navigate", "interact"],
+            description="stage D test origin")
         s.ctx.ingest("https://a.example/",
                      [{"role": "button", "name": "Go", "tag": "button",
                        "selector": "#go", "interactive": True}], tab_id="tabA")

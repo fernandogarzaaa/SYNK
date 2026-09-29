@@ -37,7 +37,8 @@ class WebMCPAdapter:
         self.ownership = ownership or OwnershipGraph()
         self.leases = leases or LeaseManager(self.ownership)
         self.safety = safety or SafetyLayer()
-        self.policy_engine = PolicyEngine(self.ownership, self.safety)
+        self.policy_engine = PolicyEngine(self.ownership, self.safety,
+                                            leases=self.leases)
 
     def discover_and_register(self, origin: str) -> WebMCPSite | None:
         """Discover a site's WebMCP tools and register them as capabilities."""

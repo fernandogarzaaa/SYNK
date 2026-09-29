@@ -3,7 +3,7 @@
   "name": "AI Co-Work Browser (Prototype)",
   "version": "0.1.0",
   "description": "Human-AI co-browsing: sidebar assistant, semantic snapshots, guarded tool execution.",
-  "permissions": ["activeTab", "scripting", "storage"],
+  "permissions": ["activeTab"],
   "host_permissions": ["http://127.0.0.1:18080/*"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
