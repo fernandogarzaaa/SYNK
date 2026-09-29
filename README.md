@@ -1,284 +1,279 @@
-# SYNK — Human–Agent Co-Work Browser Runtime
+# SYNK: Transactional Shared-State Runtime for Human-Agent Web Interaction
 
-Implements **E:\NEW PROJECT.md** (Alpha → Beta.3 → Phase 2):
-a **collaborative browser runtime** where humans and AI agents operate concurrently
-on the same web session with structured world state, action ownership, workflow
-learning, **WebMCP semantic fast path**, an evidence-backed **Truth Layer**,
-and a native **Tauri desktop shell**.
+SYNK is a runtime that lets a human and an AI agent work the same browser
+session concurrently, with every agent action executed as a supervised
+transaction and verified against independent observation.
 
-## Architecture (maps to chatgpt spec §1–25 + Beta.1 WebMCP)
+**Central invariant:** an action is successful only after independent
+observation satisfies its declared verification contract. Never because
+the planner, model, or executor returned success.
+
+## Architecture
 
 ```
-User <-> extension/sidebar <---> harness/server (127.0.0.1:18080) <---> LLM
-            | content.js (AX capture, DOM execution, typed events)   |-> cloud (OPENAI_API_KEY)
-            | background.js (bridge, run loop, transact)              |   or local mock
-            +-> WorldState + EventBus (event-sourced browser state)
-                Concurrency: OwnershipGraph + Leases + ConflictDetector
-                TransactionRunner: READ->PLAN->RESERVE->VALIDATE->EXECUTE->VERIFY
-                ActionCompiler: LLM intent -> Browser IR -> tool actions
-                WorkflowMiner + WorkflowMemory (prefs/facts/workflows/macros/failures)
-                ExecutionLadder: L0 WebMCP -> L1 DOM semantic -> L2 primitives -> L3 vision -> L4 human
-                ModelRouter: rule -> classifier -> small-local -> cloud -> vision
-                WebMCP: Discovery -> Capability Registry -> Policy/Verifier -> Direct Exec
+                    +------------------ page-supplied strings are data, never instructions
+                    |
+   +------------+   v   +-----------+   +------------------+   +-----------+
+   |  Browser   |-----> | Snapshot  |-->| ContextManager    |-->| Planner   |
+   | (extension | nodes | /snapshot |   | (refs, versions,  |   | (local /  |
+   |  or CDP)   |<----- |           |   |  quarantine)      |   |  cloud)   |
+   +------------+  ack  +-----------+   +------------------+   +-----------+
+         ^                                                        |
+         | EXECUTE (robust primitives)                            v actions
+         |                                              +------------------+
+         |                                              | ExecutionGateway |
+         |                                              |  .execute()      |
+         |                                              +--------+---------+
+         |                                                       |
+         v                                                       v
+   +-----------+   +-----------+   +--------+   +---------+   +----------+
+   | Browser   |-- | Ownership |-- | Policy |-- | Verifier |-- | Audit    |
+   |Runtime    |   | (leases)  |   | (allow |   | (claims  |   | journal  |
+   | adapter   |   |           |   |  list) |   |  + evid.)|   | (hash-   |
+   +-----------+   +-----------+   +--------+   +---------+   | chained) |
+                                                            +----------+
 ```
+
+One action's lifecycle through the gateway:
+
+```
+REQUEST -> VALIDATED -> LEASED -> PRECONDITION_CHECK -> DISPATCHED
+  -> ACKNOWLEDGED -> OBSERVING -> VERIFIED | FAILED | UNVERIFIED
+```
+
+Aggregate transaction status: `COMMITTED`, `PARTIALLY_COMMITTED`,
+`FAILED`, `UNVERIFIED`. This is transactional orchestration with
+explicit partial-commit semantics, not ACID: browser DOM mutations
+cannot be rolled back, and the system never claims otherwise.
+
+## Subsystem status
+
+Every subsystem carries one honest label:
+
+| Subsystem | Status | Notes |
+|---|---|---|
+| Transaction engine (`harness/transactions.py`) | REAL | Per-action lifecycle, typed errors, fail-closed unknown verification |
+| Execution gateway (`harness/gateway.py`) | REAL | Single entrypoint for /act, /transact, /agent/*, shell, benchmarks |
+| Event-sourced WorldState | REAL | Append-only journal, deterministic reducer, hash-chained audit |
+| Exclusive leases (`harness/concurrency.py`) | REAL | Compare-and-release, TTL, hierarchy, emergency stop; verified under thread contention |
+| Fail-closed element refs | REAL | tab/frame/origin/version/fingerprint/frame-chain/shadow-path checks |
+| Independent verifier | REAL | Evidence-strength hierarchy; command-accepted evidence can never verify |
+| Policy framework (`harness/policy.py`) | REAL | Per-origin default-deny allowlists, escalation review, consent gates |
+| Contamination guards (`harness/contamination.py`) | REAL | Injection quarantine, secret redaction, schema validation; unicode-obfuscation limits documented |
+| Task scheduler (`harness/task_scheduler.py`) | REAL | Sequential, lease-aware, dependency-ordered; dispatch correctness benchmarked |
+| Workflow learning | REAL | Miner + memory, replay/suggest endpoints |
+| Model router / compiler | REAL | Requirement-based routing, task-spec compiler with typed errors |
+| Closed-loop agent (`/agent/*`) | REAL | Observe > plan > validate > lease > execute > observe > verify > decide |
+| Extension (attached mode) | PARTIAL | Content script runs robust primitives and returns honest acks; real-Chrome end-to-end UNVERIFIED here |
+| Owned-browser adapter (Playwright/CDP) | PARTIAL | Implemented with honest mode separation; live-browser integration UNVERIFIED here |
+| WebMCP gateway | PARTIAL | Discovery, scoping, schema validation, policy; page model-context path needs a live page (UNVERIFIED here) |
+| Memory store | REAL | Task-scoped, session-isolated, secrets redacted before storage |
+| Tauri shell (`shell/`) | EXPERIMENTAL | Thin HTTP client over the harness API; Rust compile + prod build verified in CI, not run to a packaged app here |
+| Benchmarks (`benchmark/`) | REAL | All numbers measured; methodology in `benchmark/REPORT.md` |
+
+Labels: REAL (implemented, tested, exercised), PARTIAL (real code with an
+explicitly unverified integration), EXPERIMENTAL (works in CI, not
+production-hardened), TEST DOUBLE (a fake stands in for an external
+system), UNVERIFIED (not exercised in this environment).
 
 ## Quickstart
 
-```powershell
-# 1. start harness (attached-extension mode; no browser dependency)
-python -m harness.server --port 18080 --db agent_memory.db
-#    Managed-launch mode: SYNK-owned Chromium, persistent SYNK profile
-#    (requires: pip install playwright; playwright install chromium).
-#    NEVER the user's browser.
-#    python -m harness.server --port 18080 --use-cdp
-#    Explicit CDP attach (operator-named endpoint only):
-#    python -m harness.server --port 18080 --cdp-endpoint ws://127.0.0.1:9222/devtools/browser/<id>
-#    Real local SLM (see docs/local-models.md):
-#    $env:SYNK_LOCAL_MODEL='endpoint'
-#    $env:SYNK_LOCAL_MODEL_URL='http://127.0.0.1:8090/v1/chat/completions'
-# 2. run unit tests
-python -m unittest discover -s tests -v
-# 3. run headless demo (terminal 2, harness running)
-python demo/demo_script.py
-# 4a. load extension in Chrome: chrome://extensions -> Developer mode ->
-#     Load unpacked -> select extension/
-# 4b. desktop shell (requires Rust + Node): cd shell; npm install; npm run tauri dev
+Prerequisites: Python 3.11+, `pip install pytest`. No browser needed for
+the harness path below. Every command here was executed against the
+local harness during Stage H verification.
+
+```bash
+# 1. Start the harness (extension mode; no browser dependency)
+python -m harness.server --port 18080
+
+# 2. In another terminal: register the page origin
+#    (Stage F policy is default-deny: unknown origins fail closed)
+curl -X POST http://127.0.0.1:18080/policy/origin \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"demo.shop","allow":["read","navigate","interact"]}'
+
+# 3. Push a page snapshot (what the extension's content.js captures)
+curl -X POST http://127.0.0.1:18080/snapshot \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://demo.shop/checkout","tab_id":"t1","goal":"Fill the form",
+       "nodes":[{"role":"textbox","name":"Email","tag":"input",
+                 "selector":"#email","interactive":true}]}'
+
+# 4. Execute one action through the gateway
+curl -X POST http://127.0.0.1:18080/act \
+  -H 'Content-Type: application/json' \
+  -d '{"actions":[{"tool":"type","selector":"#email","text":"inan@example.com"}],
+       "tab_id":"t1","page_url":"https://demo.shop/checkout","task_id":"qs1"}'
+# -> transaction_status: UNVERIFIED (honest: no browser observation yet)
+
+# 5. Inspect the hash-chained audit trail
+curl http://127.0.0.1:18080/audit
 ```
 
-With `OPENAI_API_KEY` set, `/plan` uses a cloud model; otherwise (and for
-simple queries like "what is the label…") it uses the local deterministic
-planner — the prototype works fully offline.
+Browser modes (need a real browser; not exercised in CI):
 
-## Alpha endpoints (unchanged)
-| Method | Endpoint | Purpose |
-|---|---|---|
-| GET | `/health` | liveness + version |
-| POST | `/snapshot` | ingest page nodes → trimmed context + prompt (carries explicit `tab_id`/`window_id`/`frame_id`/`session_id`) |
-| POST | `/plan` | LLM action plan for goal (includes tier, execution level) |
-| POST | `/act` | canonical execution via ExecutionGateway: honest per-action lifecycle (REQUEST → VALIDATED → LEASED → PRECONDITION_CHECK → DISPATCHED → ACKNOWLEDGED → OBSERVING → VERIFIED), per-action claims, aggregate `transaction_status` |
-| POST | `/human` | `{active}` human-priority pause flag |
-| GET | `/memory` | summary/prefs/recent |
-| POST | `/memory/pref`, `/memory/forget` | learn / GDPR forget |
-| GET | `/audit` | tamper-evident log + chain check |
+```bash
+# SYNK-owned Chromium, persistent SYNK profile (never the user's browser)
+# requires: pip install playwright && playwright install chromium
+python -m harness.server --port 18080 --use-cdp
 
-## Beta endpoints (new)
-| Method | Endpoint | Purpose |
-|---|---|---|
-| POST | `/event` | push typed browser event (DOM, focus, human action…) |
-| GET | `/world` | WorldState snapshot + ownership + recent events |
-| POST | `/lease` | `{target,intent,ttl,tab_id}` → EXCLUSIVE short-lived agent lease (or 409); release is compare-and-release `{target, release: lease_id}` |
-| POST | `/estop` | `{active}` global emergency stop: revokes all agent leases, blocks new ones (separate from resource ownership) |
-| POST | `/transact` | transactional co-execution via ExecutionGateway: bulk actions expand to one lifecycle + claim per sub-action; returns `transaction_status` (COMMITTED / PARTIALLY_COMMITTED / FAILED / UNVERIFIED) |
-| POST | `/compile` | `{intent,slots}` → Browser IR + lowered tool actions |
-| GET | `/ladder` | execution ladder levels + registered site adapters |
-| POST | `/workflow/observe` | `{steps,intent}` → mine candidates / confirm workflows |
-| POST | `/workflow/suggest` | `{domain,intent}` → predictive prep + model tier hint |
-| GET | `/workflows` | list confirmed workflows |
-| POST | `/benchmark` | run headless Beta benchmark suite (AES) |
-
-## Beta.1 WebMCP endpoints (new)
-| Method | Endpoint | Purpose |
-|---|---|---|
-| POST | `/webmcp/discover` | `{tab_id, frame_id?, session_id?}` → per-document model-context discovery (Stage E: page-advertised tools only, fail-closed) |
-| POST | `/webmcp/capabilities` | `{goal, tab_id, ...}` → deterministic selection: all candidates, score breakdowns, winner, rationale |
-| POST | `/webmcp/invoke` | `{tool_name\|goal, args, tab_id, ...}` → invocation through the transaction engine: claims, evidence, verification |
-| POST | `/webmcp/execute` | legacy Beta.1 fixture path, kept for compatibility and labeled PARTIAL (never verifies a claim) |
-
-## Stage C endpoints (new): closed-loop agent
-| Method | Endpoint | Purpose |
-|---|---|---|
-| POST | `/agent/begin` | `{goal, identity, max_steps}` → mint `task_id`, pin tab identity |
-| POST | `/agent/next` | OBSERVE → plan → VALIDATE → LEASE → returns `{"decision": "act", action, claim_id, lease_id}` or `success / continue / replan / request-human / abort` |
-| POST | `/agent/report` | `{task_id, action_id, claim_id, status}` → VERIFY against the post-action observation → DECIDE (lease released exactly once here) |
-| POST | `/agent/status` | task state: steps used/remaining, verified count, replans, history |
-| POST | `/agent/observe` | OBSERVE only: change flags (navigation, modal, human interference) without planning |
-
-## Stage G endpoints (new): scheduler, workflows, router, compiler
-| Method | Endpoint | Purpose |
-|---|---|---|
-| POST | `/task/submit` | `{goal, spec\|actions, tab_id, depends_on, budgets, requirements, origin, ...}` → enqueue on the SEQUENTIAL scheduler (spec compiled first; typed 400 on compile errors) |
-| POST | `/task/poll` | `{task_id}` → task status, budgets, routing decision, result |
-| POST | `/task/cancel` | `{task_id}` → cancel a queued/blocked task; flag a running one |
-| POST | `/task/run` | dispatch the next ready task through the execution gateway (per-action verification); a task completes only when its transaction COMMITTED |
-| POST | `/compile` | `{spec}` → validated action plan (capability + policy checked); typed `CompileError` on failure (legacy `{intent, slots}` still accepted) |
-| GET | `/workflows/learned` | list workflows learned from verified transactions |
-| POST | `/workflows/get` | `{name}` → one workflow with params, defaults, provenance |
-| POST | `/workflows/suggest` | `{goal, top_n}` → deterministic matches with recorded rationale |
-| POST | `/workflows/learn` | `{task_id, goal, domain}` → learn from a recorded verified transaction report |
-| POST | `/workflows/replay` | `{name, params, tab_id, ...}` → render params and execute through the gateway with per-action verification |
-| GET | `/models` | the configured model registry (source, backends, declared capabilities) |
-| POST | `/route` | `{requirements, task_id}` → deterministic capability-based routing decision |
-
-Model registry configuration: `SYNK_MODELS` (JSON list) or `SYNK_MODELS_FILE` (path to JSON). Without either, the router reports a single built-in default backend and says so.
-
-## Key advances
-
-### Alpha (✓)
-- Extension scaffold, basic LLM+tools, sidebar, harness loop
-- Safety: allowlist, consent, human-priority, PII masking, injection detection, audit chain
-
-### Beta (✓)
-1. **WorldState + Event Bus** — event-sourced browser state; LLM receives "WORLD_STATE vN + changed keys"
-2. **Concurrency** — ownership graph (FREE/HUMAN/AGENT/CONFLICT), short leases, intent-level conflict detection, transactional execution
-3. **Action Compiler** — LLM intent → Browser IR (preconditions + ops + verification) → deterministic tool actions
-4. **Execution Ladder** — WebMCP → DOM semantic → primitives → vision → human (graceful degradation)
-5. **Workflow Mining** — human actions → pattern detector → confirmed workflows → predictive prep without LLM
-6. **Model Router** — 5 tiers (rule → classifier → small-local → cloud → vision)
-7. **Benchmark Harness** — AES = task_success / (tokens + latency_w + actions_w)
-
-### Beta.1 (✓)
-8. **WebMCP Adapter** — Discovery → Capability Registry → Policy Engine → Verifier → Direct Exec
-   - Capabilities have risk classification (low/medium/high/critical), latency class, consent requirements
-   - Policy engine enforces ownership/conflict/consent checks on top of site-exposed tools
-   - Even `deleteAccount()` from a site goes through the harness safety pipeline
-9. **Capability Registry** — unified view of all capabilities across sources (webmcp/dom/primitive/vision)
-10. **Benchmarks with Co-working Metrics** — interference rate, agent overlap rate, recovered conflict rate, agent tax
-
-### Stage C (✓): honest transactions + closed loop
-11. **ExecutionGateway** — the single `ExecutionGateway.execute(request)` used by `/act`, `/transact`, the extension, Tauri (via `/act`), and tests. HTTP endpoints are thin adapters; no caller bypasses the transaction / ownership / verification pipeline.
-12. **Honest transaction lifecycle** — every action moves through REQUEST → VALIDATED → LEASED → PRECONDITION_CHECK → DISPATCHED → ACKNOWLEDGED → OBSERVING → VERIFIED. "ACKNOWLEDGED" means the executor accepted the command, never that the browser performed it. Extension mode queues commands; only an independent post-execution observation can VERIFY a claim.
-13. **Per-action claims, batch expansion** — `bulk` actions expand so each sub-action gets its own lifecycle, exclusive lease, and claim through the single global Verifier. No vague batch claims.
-14. **Typed error taxonomy** — POLICY_DENIED, CONSENT_REQUIRED, OWNERSHIP_CONFLICT, STALE_REFERENCE, BROWSER_NOT_READY, ACTION_FAILED, TIMEOUT, NAVIGATION_CHANGED, VERIFICATION_FAILED, VERIFICATION_UNAVAILABLE, TOOL_NOT_FOUND, SCHEMA_INVALID. Callers decide (retry / replan / ask human / abort) from the code, not from string matching.
-15. **Aggregate transaction states** — COMMITTED / PARTIALLY_COMMITTED / FAILED / UNVERIFIED. ROLLED_BACK is reported only if compensating rollback handlers actually run; browser DOM mutations are not ACID, and this is documented as transactional orchestration with explicit partial-commit semantics.
-16. **Evidence strength + provenance hierarchy** — command-accepted evidence and bare screenshots can never verify a state postcondition; screenshots require explicit `vision_verified=True`. Unknown postcondition kinds and unknown named verification checks fail closed as UNVERIFIED.
-17. **Closed-loop agent** — `/agent/*` endpoints plus the extension's rewritten `runTask()`: observe → update world → select capability → plan → validate → lease → execute one mutation → observe → verify → decide (success | continue | replan | request-human | abort). Step budgets are task-scoped (`TaskExecutionContext`); tasks never share one budget. Refs are pinned to a snapshot version and fail closed on drift; leases release exactly once in `/agent/report`.
-18. **`page.loaded` dedup** — snapshots are journaled exactly once via the single bus-event ingest path.
-
-### Stage D (✓): real browser layer
-19. **Browser adapter contract** (`harness/browser_runtime.py`) — REAL: one `BrowserRuntime` interface (lifecycle, targeting, observation, interaction, inspection, events) with typed errors, per-tab health states, and a `BrowserAck` that makes `executed=True` inseparable from the post-state observation.
-20. **Three honest browser modes** — attached-extension (default; the user's own browser, driven only via extension snapshots + the `/agent/*` closed loop, SYNK never launches or debugs anything), owned-launch (`--use-cdp`; SYNK-managed Chromium with a persistent SYNK-owned profile, explicitly NOT the user's browser), attached-endpoint (`--cdp-endpoint`; connects only to the operator-named CDP endpoint). The old "attach to the user's browser via --remote-debugging-port" implication is gone.
-21. **Robust interaction primitives** — `harness/interactions.py` (mirrored in `extension/content.js`): native value setter for controlled React/Vue/Svelte inputs, contenteditable, checkbox/radio, select, keyboard sequences, shadow-DOM traversal, frame targeting with fail-closed mismatch, and post-state observation before replying.
-22. **Ref-safe dispatch** — opaque integer refs are resolved through `RefResolver` before reaching any adapter; the old `page.click("3")` bug is gone. Refs carry frame chains and shadow paths and fail closed on drift.
-23. **Browser acknowledgements** — the extension's `EXECUTE` handler performs the robust primitive and replies with a `BROWSER_ACK` carrying the observed post-state; the background loop only reports `executed` when the ack says so, and forwards it to `/agent/report`. The server validates the ack (fail closed on `executed=True` without an observation, or on action-id mismatch) and records it as `BROWSER_ACK` evidence: audit trail only, it can NEVER verify a postcondition. Lifecycle: DISPATCHED → BROWSER_ACK → OBSERVED → VERIFIED.
-24. **Frame/document identity** — frames carry parent, frame chain, and the browser's own frame id; document identity is preserved across snapshot events and replaced on navigation (so stale refs fail closed).
-
-### Stage E (✓ implementation; live-browser WebMCP UNVERIFIED)
-25. **Real WebMCP through page-advertised model context** — discovery is per (session, tab, frame, document); only tools the page's own `navigator.modelContext` advertises are invocable. Handles are sha256-derived from the scope (never Python `hash()`), so a cross-tab handle is unaddressable and a post-navigation handle is stale: both fail closed.
-26. **Deterministic capability selection** — `3 * name_hits + desc_hits + schema_bonus` with required-schema-term bonus; ties break by score, risk, then name. `/webmcp/capabilities` returns every candidate, its score breakdown, the winner, and the rationale, all written to the audit trail. Zero-score goals produce no winner, never a silent substitution.
-27. **Invocation through the transaction engine** — `/webmcp/invoke` and the `webmcp_invoke` tool run the same REQUEST → VALIDATE → RESERVE → DISPATCH → OBSERVE → VERIFY lifecycle as DOM actions: schema checks, policy/consent gates, per-action claims, `WEBMCP_RESULT` evidence, and `webmcp_result` postcondition verification. A page-reported `ok=True` verifies; a page-reported failure marks the claim FAILED; fixture results can never verify (the verifier refuses `partial_fallback` evidence outright, in both the postcondition and generic paths).
-28. **Fail-closed missing tools; honest unavailability** — a tool the page did not advertise fails with `WEBMCP_TOOL_NOT_ADVERTISED` (zero transport calls, zero fallback calls, even with opt-in on). No model context reports `webmcp_unavailable`. A model context with zero tools is reported available (not unavailable) and never enables the fallback.
-29. **Opt-in PARTIAL fixture fallback only** — `--webmcp-fallback` wires the legacy fixture table when the page exposes no model context at all; every such result carries the PARTIAL caveat and is labeled PARTIAL wherever it surfaces. The old `/webmcp/execute` endpoint is preserved as this labeled legacy path.
-30. **Closed-loop WebMCP** — the extension probes `navigator.modelContext` per page (sync or async listings, plus declarative `script[type="webmcp-tool"]` blocks), pushes the report with snapshots, performs `WEBMCP_INVOKE` in the target frame, and reports the page's own tool outcome to `/agent/report`, which records it as `WEBMCP_RESULT` evidence before verifying (failed reports are recorded too, never silently dropped).
-
-Labels: `CdpModelContextTransport` and the probe JS are REAL code paths (UNVERIFIED against a live page: no `navigator.modelContext` existed in the build environment). `ExtensionSnapshotTransport` is REAL page-reported data (async; synchronous invoke honestly refuses with `BROWSER_NOT_READY`). `FakeModelContextTransport` is a TEST DOUBLE used by `tests/test_stage_e.py` (27 tests) — nothing about its output is presented as a live page. The fixture fallback and `/webmcp/execute` are PARTIAL.
-
-### Stage F (✓): security policy framework + privacy/memory redesign + least privilege
-
-31. **Origin policy, default-deny** (`harness/policy.py`) — REAL: every action's origin must be explicitly registered with allow/deny/consent sets per action class (`read`, `navigate`, `interact`, `write`, `webmcp`) and a minimum trust level. Unknown origins fail closed with typed `POLICY_DENIED` BEFORE lease acquisition; undeterminable origins abstain to the legacy safety path. `GET /policy`, `POST /policy/origin` (typed HTTP 400 on bad input), `POST /policy/origin/remove`.
-32. **WebMCP hardening** — REAL: tool names validated as identifiers before touching discovery state; args validated against the tool's DECLARED JSON schema (required, nested, types, `additionalProperties`, `enum`, length, bounds) with `SCHEMA_INVALID` fail-closed; page tool advertisements quarantined (drop + journal with `q_<sha256>` id) on invalid names or injection; handles bound to the discovering principal (session) and trust level (`page-advertised`/`operator-verified`/`operator-trusted`), cross-session invocation fails closed; page results secret-redacted, size-capped, and injection-scanned before evidence; the dead `pass` lease branch in `webmcp/policy.py` is now a real live-lease check threaded from the engine's held lease.
-33. **Prompt-injection quarantine** (`harness/contamination.py`, `ContextManager.ingest`) — REAL: deterministic scan of every text-bearing node field; matches replaced with a placeholder BEFORE prompt construction; journal keeps quarantine ids and markers, never hostile text.
-34. **Privilege-escalation tracking** — REAL: per-task capability rank; read-to-mutating transitions record a fresh `policy.escalation_review` decision; escalation into denied classes fails closed.
-35. **Memory redesign** (`harness/memory.py`) — REAL: scopes (`task` 24h, `session` 7d, `long_term` 365d TTL) with expiry purge; secret redaction BEFORE storage and preference learning that refuses password fields/secret-shaped values; session-isolated reads (session A cannot read session B); physical verified deletion (`POST /memory/delete`, `POST /memory/forget_session`, wipe with post-delete verification); `PRAGMA secure_delete=ON`; journal events carry SHA-256 hashes, never content; legacy plaintext `actions` tables are migrated redacted and dropped.
-36. **Least privilege** — REAL: extension manifest reduced to `activeTab` + the local harness host permission (unused `scripting`/`storage` removed); no `eval`/`exec`/`subprocess`/`os.system`/`pickle.loads` anywhere in the execution path (regression-scanned in tests); `__import__("os")` replaced with a normal import; one canonical origin form shared by policy, registry, and WebMCP gateway. See `SECURITY.md` for the full model and residual risks.
-
-Stage F labels: the policy engine, quarantine, schema validation, principal binding, memory redesign, and permission minimization are REAL and covered by `tests/test_stage_f.py` (62 tests). PARTIAL: injection quarantine and secret redaction are pattern-based and can miss novel phrasing/formats (documented in `SECURITY.md` §7). UNVERIFIED: live-browser WebMCP (unchanged from Stage E); memory is not encrypted at rest.
-
-### Stage G (✓): honest scheduler + workflow learning + model routing + task compiler
-
-37. **SEQUENTIAL task scheduler** (`harness/task_scheduler.py`, Phase 9) — REAL: task submission, status query, cancellation, per-task budgets (`max_steps` enforced at submit, `max_seconds` enforced around dispatch), dependency gating, and lease-aware dispatch (a task only starts when its tab lease is free; otherwise it waits `blocked` with a recorded reason). The old `ParallelScheduler` claimed parallelism it never executed; it is kept for import compatibility only, and `/task/*` now runs on the honest scheduler. Concurrency decision: SEQUENTIAL only. The browser runtimes, ToolExecutor, AgentLoop, and server STATE are not thread-safe, so a LIMITED parallel mode would be a lie; real concurrency would need per-tab thread-safe runtimes with isolated CDP sessions (the lease system, the dispatch gate, already exists).
-38. **Lease nesting contract** — REAL: the scheduler holds `tab:<id>` for the running task; the transaction engine's per-action leases nest under it only for the same task id (`LeaseManager.acquire(..., nest_under_task_id=...)`). Actions from any other task, the human, or a conflict still refuse. Covered by regression tests.
-39. **Workflow learning from verified transactions** (`harness/workflow_store.py`, Phase 13) — REAL: `WorkflowLearner` records only action sequences whose every verification result is VERIFIED (COMMITTED transactions auto-learn; anything else never enters the store). Steps are parameterized (`text`/`value`/`url` → `{{p0}}` with recorded defaults); re-observing a shape bumps counts instead of duplicating. `suggest` scores deterministically (term coverage + confidence + success count) and records its rationale; `replay` renders params and executes through the execution gateway with per-action verification, never blindly. Endpoints: `/workflows/learned`, `/workflows/get`, `/workflows/suggest`, `/workflows/learn`, `/workflows/replay`.
-40. **Capability-based model router** (`harness/model_router.py`, Phase 14) — REAL: the registry is operator-declared (`SYNK_MODELS` JSON or `SYNK_MODELS_FILE`); entries carry capabilities, declared context size, and an operator-declared cost tier (no benchmark numbers invented anywhere). Routing is deterministic: required-capability coverage first, then context for long-horizon tasks, then cost, then name. No eligible backend refuses loudly instead of picking a bad one. With a single configured backend the router says so and routes to it. The scheduler records the routing decision per task. Endpoints: `GET /models`, `POST /route`.
-41. **Validating task compiler** (`harness/compiler.py`, Phase 5) — REAL: structured-dict specs only (free text is rejected with `SCHEMA_INVALID`); every action is validated against the capability registry, per-tool required args, `key == value` preconditions, and the known postcondition kinds before the plan is returned. With a policy registry configured, each action is policy-checked at compile time (unknown origins and denied classes fail with typed `POLICY_DENIED`/`CONSENT_REQUIRED`); without one the plan is honestly flagged `policy_checked: false`. Compilation failures are typed `CompileError`s, never silent drops. `/compile` now returns 400 with the typed error; compiled plans enter the scheduler via `/task/submit`'s `spec` field.
-
-Stage G labels: scheduler, lease nesting, workflow learning, model router, and compiler are REAL and covered by `tests/test_stage_g.py` (43 tests). PARTIAL: workflow parameterization names params positionally (`p0`, `p1`) rather than semantically; the router's cost tiers are operator-declared, not measured. UNVERIFIED: no live-browser run (task execution through the gateway was verified against the real transaction engine; end-to-end browser execution remains Stage D's noted gap).
-
-Honest limitations (not hidden):
-- No real Chrome/CDP session was available in the build environment: browser behavior was validated through a deterministic fake backend (67 tests in `tests/test_stage_d.py`) plus syntax and contract checks. The Playwright adapter's real-browser integration (launch, attach, crash hooks, frame walking) is implemented but UNVERIFIED against a live browser.
-- `dismiss_dialog` in the owned adapter returns the recorded dialog list; it does not dismiss a live dialog (Playwright auto-dismisses only when a handler is registered).
-- Frame ids for subframes are content-script-local (`sub:<hash>`); Chrome's numeric `frameId` is recorded when known but cross-frame targeting still relies on the chain.
-- WebMCP's `/webmcp/execute` is the legacy Beta.1 fixture path, kept for compatibility and labeled PARTIAL; it can never verify a claim. The Stage E gateway (`/webmcp/discover`, `/webmcp/capabilities`, `/webmcp/invoke`) discovers page-advertised model-context tools per (session, tab, frame, document) and invokes them through the transaction engine with per-action verification.
-- Live-browser WebMCP was NOT verified: no page in the build environment exposes `navigator.modelContext`, so discovery/invocation ran against the explicit `FakeModelContextTransport` test double (27 tests in `tests/test_stage_e.py`). The CDP probe JS (`MODEL_CONTEXT_PROBE_JS` / `MODEL_CONTEXT_INVOKE_JS`), the content-script probe, and `OwnedBrowserRuntime.evaluate_js` are implemented but UNVERIFIED against a live page.
-- In extension mode the gateway's synchronous path reports UNVERIFIED until the closed loop's post-action observation arrives.
-- The mock planner and local model stubs remain deterministic heuristics for offline use; they are labeled as such in responses (`+mock-offline`).
-
-## Safety (Alpha + Beta + Beta.1 §21)
-
-- Fixed tool allowlist; unknown tools ignored. No arbitrary code execution.
-- Destructive actions require sidebar consent checkbox.
-- Human input pauses the agent; user always wins conflicts (Alpha fallback).
-- PII masked in prompts; page text tagged `<untrusted_page_content>`, injection flagged.
-- Every decision hash-chained in `/audit`; domain allowlist + banking view-only policy.
-- **Beta adds**: ownership + leases + precondition validation before execute.
-- **Beta.1 adds**: WebMCP capabilities pass through PolicyEngine (ownership/conflict/consent) before execution.
-- **Stage F adds**: per-origin default-deny policy (unknown origins fail closed before lease acquisition); WebMCP tool-name validation, declared-schema validation, advertisement quarantine, principal-bound handles, live-lease verification, and result sanitization; deterministic prompt-injection quarantine of page text before prompt construction; privilege-escalation review journaling; memory scopes with TTL, secret redaction before storage, session-isolated reads, and physically verified deletion; extension permissions minimized to `activeTab` + local harness host. Full model and residual risks in `SECURITY.md`.
-
-## Performance (Alpha + Beta + Beta.1)
-
-- Single-snapshot retention, rule-based trim, token estimate per step.
-- Bulk fill: whole form in 1 LLM call (demo shows round-trips saved).
-- Incremental diffs; model routing (simple→local, complex→cloud).
-- **Beta adds**: WorldState diffs replace full snapshots per step; workflow reuse avoids LLM entirely for repeated tasks.
-- **Beta.1 adds**: WebMCP Level 0 bypasses DOM interaction entirely for supported sites.
-
-## Status checklist
-
-- [x] Alpha: extension scaffold, basic LLM+tools, sidebar, harness loop
-- [x] WorldState + EventBus + incremental diffs
-- [x] Ownership + Leases + ConflictDetector + TransactionRunner
-- [x] ActionCompiler (Browser IR) + ExecutionLadder + SiteRegistry
-- [x] WorkflowMiner + WorkflowMemory (prefs/facts/workflows/macros/failures)
-- [x] ModelRouter (5 tiers)
-- [x] Benchmark harness (AES) + headless suite + co-working scenarios
-- [x] **WebMCP adapter registry (Level 0)**
-- [x] **Stage E: real WebMCP** — per-document discovery, page-advertised tools only, deterministic selection with full rationale, invocation through the transaction engine with `webmcp_result` verification, fail-closed missing tools, honest `webmcp_unavailable`, opt-in PARTIAL fixture fallback (never verifies), closed-loop extension path. 27 tests in `tests/test_stage_e.py`. Live-browser WebMCP UNVERIFIED (no `navigator.modelContext` in the build environment; exercised through the `FakeModelContextTransport` test double).
-- [x] **Capability Registry with risk/ownership/policy**
-- [x] **WebMCP policy-gated execution + verifier**
-- [x] **Truth Layer wired**: `/act`/`/transact` record Evidence + Claims, verify honestly
-- [x] **Scheduler execution loop**: `/task/submit|poll|run` with deps + tab guards
-- [x] **Real consent flow**: `consent_required` → shell confirm → resubmit consented
-- [x] **Tauri shell compiles** (`cargo check` clean): world/ownership/events UI + consent
-- [x] **EVE validation**: experience run caught + fixed demo defects (29→33, overlaps gone)
-- [x] **Live test green**: snapshot→plan→act→verify, scheduler chain, consent, audit
-- [ ] On-device SLM integration (mlc-llm/WebLLM for Tier 1/2; mock stands in)
-- [ ] Deep Chromium integration (Phase 3+ of chatgpt roadmap)
-
-## Roadmap
-
-| Phase | Focus | Target |
-|---|---|---|
-| 1 (now) | Extension-based runtime | ✓ Beta.1 |
-| 2 | Desktop shell (Tauri/Electron) | next |
-| 3 | Controlled Chromium build | later |
-| 4 | Deep browser integration | later |
-
-**Your Alpha does not need to be thrown away** — its `context_manager`, `tools`, `memory`,
-`safety`, `orchestrator`, and MV3 bridge are good seeds refactored around
-`WorldState + EventBus + Ownership + Transaction + Capabilities`.
-
-## Running the Beta benchmark
-
-```powershell
-python -m harness.server --port 18080   # terminal 1
-# terminal 2:
-python -c "
-import http.client, json
-conn = http.client.HTTPConnection('127.0.0.1', 18080)
-conn.request('POST', '/benchmark', '{}', {'Content-Type': 'application/json'})
-print(json.dumps(json.loads(conn.getresponse().read().decode()), indent=2))
-"
+# Attach to an operator-named CDP endpoint (explicit, never implied)
+python -m harness.server --port 18080 --cdp-endpoint ws://127.0.0.1:9222/devtools/browser/<id>
 ```
 
-Output includes per-task AES and summary with `mean_aes`, `total_tokens`,
-`total_conflicts`, `total_cost_usd`, plus co-working metrics:
-`interference_rate`, `agent_overlap_rate`, `recovered_conflict_rate`, `agent_tax`.
+Tests and benchmarks:
 
-## WebMCP quick test
-
-```powershell
-python -m harness.server --port 18080   # terminal 1
-# terminal 2:
-python -c "
-import http.client, json
-conn = http.client.HTTPConnection('127.0.0.1', 18080)
-# Discover tools
-conn.request('POST', '/webmcp/discover', json.dumps({'origin': 'shop.example.com'}), {'Content-Type': 'application/json'})
-print(json.dumps(json.loads(conn.getresponse().read().decode()), indent=2))
-# Execute read-only tool
-conn.request('POST', '/webmcp/execute', json.dumps({'origin': 'shop.example.com', 'tool': 'searchProducts', 'args': {'query': 'MacBook'}}), {'Content-Type': 'application/json'})
-print(json.dumps(json.loads(conn.getresponse().read().decode()), indent=2))
-# Execute destructive tool (needs consent)
-conn.request('POST', '/webmcp/execute', json.dumps({'origin': 'shop.example.com', 'tool': 'checkout', 'args': {}, 'user_consented': True}), {'Content-Type': 'application/json'})
-print(json.dumps(json.loads(conn.getresponse().read().decode()), indent=2))
-"
+```bash
+python -m unittest discover -s tests        # 325 tests
+python -m pytest tests/ -q                  # 330 tests
+python benchmark/runner.py                  # regenerates benchmark/results.json
 ```
+
+## Endpoint reference
+
+Base URL defaults to `http://127.0.0.1:18080`. All POST bodies are JSON.
+
+**Reads (GET):** `/health`, `/world`, `/audit`, `/memory`, `/ladder`,
+`/workflows`, `/workflows/learned`, `/models`, `/policy`,
+`/webmcp/capabilities`.
+
+**Execution (POST):**
+
+| Endpoint | Purpose |
+|---|---|
+| `/snapshot` | Ingest a page snapshot; returns versioned element refs (page text quarantined on the way in) |
+| `/plan` | Plan actions for a goal against the pinned tab's snapshot |
+| `/act` | Execute actions through the gateway (thin adapter; per-action results + verifications) |
+| `/transact` | Execute an explicit transaction (same gateway, caller-supplied transaction id) |
+| `/agent/begin` | Start a closed-loop task (pins the tab; task-scoped budgets) |
+| `/agent/observe` | Push a fresh observation into the task |
+| `/agent/next` | Get the next planned action for the task |
+| `/agent/report` | Report execution with a browser ack (dishonest acks rejected) |
+| `/agent/status` | Task state, budgets, verification counts |
+| `/event` | Ingest a browser event (navigation, dialog, download, network) |
+| `/lease` | Inspect active leases |
+| `/estop` | Emergency stop: refuse all new lease acquisitions |
+
+**Scheduling / workflows (POST):** `/task/submit`, `/task/poll`,
+`/task/cancel`, `/task/run`, `/compile`, `/route`,
+`/workflow/observe`, `/workflow/suggest`, `/workflows/learn`,
+`/workflows/get`, `/workflows/suggest`, `/workflows/replay`,
+`/workflows/learned`.
+
+**Verification (POST):** `/verification/claim`, `/verification/verify`,
+`/verification/evidence`, `/vision/capture`.
+
+**WebMCP (POST):** `/webmcp/discover`, `/webmcp/invoke`,
+`/webmcp/execute` (+ `GET /webmcp/capabilities`).
+
+**Memory (POST):** `/memory/pref`, `/memory/forget`, `/memory/delete`,
+`/memory/forget_session` (+ `GET /memory`).
+
+**Policy (POST):** `/policy/origin`, `/policy/origin/remove`
+(+ `GET /policy`).
+
+**Misc (POST):** `/human` (human input/interrupt), `/benchmark`
+(synthetic headless benchmark), `/models` (model routing info).
+
+## Verification contract
+
+1. Every mutating action declares a postcondition (`element_value`,
+   `element_interaction`, `url`, `webmcp_result`).
+2. Only evidence types appropriate to that postcondition may verify it
+   (`harness/verification/evidence.py: POSTCONDITION_EVIDENCE`).
+3. Command-accepted evidence (`BROWSER_EVENT`, `BROWSER_ACK`) is
+   audit-trail only: it can never verify, by construction.
+4. Screenshots verify only with a dedicated vision-verification result.
+5. Unknown postcondition kinds and unknown named checks fail closed as
+   `UNVERIFIED`.
+6. Execution failure (`FAILED`) is never reported as verification
+   failure: if the tool call itself fails, no claim is proposed.
+
+## Security model
+
+Summary; the full model is in `SECURITY.md`.
+
+- **Default-deny policy:** every page origin must be registered with an
+  explicit allowlist before any action runs there. Unknown origins fail
+  closed. Privilege escalation (read -> mutate) triggers a fresh,
+  recorded policy review.
+- **Page text is untrusted data:** node text, tool advertisements, and
+  tool results pass through contamination guards. Injection-bearing
+  strings are quarantined (placeholder in the planner's view, id +
+  markers in the audit trail, never the hostile payload). Secrets are
+  redacted before anything is persisted or echoed.
+- **Capability least privilege:** WebMCP handles are bound to
+  (session, tab, frame, document); cross-tab, cross-session, and
+  post-navigation reuse fail closed. Tool names must be clean
+  identifiers; inputs are schema-validated.
+- **Human priority:** exclusive leases serialize agent/human access to
+  the same target; the human always wins conflicts. Emergency stop
+  refuses all new acquisitions.
+- **Memory privacy:** records are task-scoped and session-isolated;
+  the journal stores content hashes, not content; forget/delete
+  endpoints actually delete.
+- **Adversarial suite:** `tests/test_adversarial.py` (40 tests) attacks
+  every entry point above and asserts the fail-closed outcome.
+
+## Benchmarks
+
+`python benchmark/runner.py` regenerates `benchmark/results.json`.
+Methodology and literal numbers: `benchmark/REPORT.md`. Headlines from
+the Stage H run (Python 3.12.3, this machine):
+
+- Gateway throughput: 1663.71 actions/sec (harness overhead, extension
+  mode, no browser)
+- Verifier accuracy: 19/19 declared claim/evidence pairs correct
+- Lease contention: 8 threads x 50 attempts, 0 exclusivity violations
+- Policy check: mean 3.16 us, p99 5.65 us
+- Scheduler dispatch: dependency order, FIFO, and tab-lease blocking
+  all correct; mean dispatch 0.029 ms
+
+## What this is not
+
+- **Not ACID transactions.** Browser DOM mutations cannot be rolled
+  back. The aggregate states (`PARTIALLY_COMMITTED`, `UNVERIFIED`)
+  exist precisely to report partial truth.
+- **Not a parallel scheduler.** `TaskScheduler` dispatches sequentially;
+  "parallel" in older docs meant multi-tab task tracking, not concurrent
+  execution.
+- **Not verified against a live browser in this environment.** The
+  extension content script, the Playwright/CDP adapter, and the page
+  model-context WebMCP path are implemented and unit-tested against a
+  deterministic fake backend, but no real Chrome/CDP session was
+  available here. `FINAL-REPORT.md` lists exactly what a future
+  operator must do to verify the live-browser path.
+- **Not a production browser.** The Tauri shell is a thin operator UI
+  over the harness HTTP API, EXPERIMENTAL, not a hardened product.
+- **No invented metrics.** Every number in `benchmark/REPORT.md` was
+  measured by running `benchmark/runner.py`; removed legacy benchmark
+  files existed only to compare mock agents on hard-coded timings.
+
+## Repository layout
+
+```
+harness/            Python runtime (stdlib only; playwright optional)
+  gateway.py        Single execution entrypoint
+  transactions.py   Per-action lifecycle + typed errors
+  verification/     Claims, evidence, results, the independent Verifier
+  browser_*.py      BrowserRuntime contract + attached/owned adapters
+  interactions.py   Robust interaction primitives
+  policy.py         Per-origin default-deny policy + escalation review
+  contamination.py  Injection quarantine, secret redaction, schema checks
+  task_scheduler.py Sequential lease-aware scheduler
+  webmcp/           Page model-context gateway (discovery, scoping, invoke)
+  memory.py         Task-scoped, session-isolated memory
+  server.py         HTTP API (the operator surface)
+extension/          Chrome extension (attached mode)
+shell/              Tauri desktop shell (EXPERIMENTAL)
+benchmark/          Honest benchmarks + REPORT.md + results.json
+tests/              330 pytest / 325 unittest, incl. adversarial suite
+demo/               Headless demo against the local harness
+docs/               Local-model setup and other operator docs
+SECURITY.md         Full security model
+FINAL-REPORT.md     SYNK 2.0 program completion report
+```
+
+## License
+
+MIT. See `LICENSE`.
