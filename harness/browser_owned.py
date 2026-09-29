@@ -315,7 +315,7 @@ class OwnedBrowserRuntime(BrowserRuntime):
         # real pages, so the deadlock was invisible in unit tests.)
         with self._lock:
             if self._mode is None:
-                raise ValueError(
+                raise RuntimeError(
                     "use OwnedBrowserRuntime.launch() or .attach(), not "
                     "the bare constructor")
             if self._connected:
