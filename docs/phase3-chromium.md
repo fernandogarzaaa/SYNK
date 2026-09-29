@@ -1,4 +1,4 @@
-# Phase 3: Controlled Chromium — feasibility + plan
+# Phase 3: Controlled Chromium: feasibility + plan
 
 ## Verdict
 

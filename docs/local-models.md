@@ -12,7 +12,7 @@ dependencies beyond stdlib (`harness/local/model.py: EndpointLocalModel`).
 2. Weights (1.1 GB):
    `Qwen/Qwen2.5-1.5B-Instruct-GGUF`, file
    `qwen2.5-1.5b-instruct-q4_k_m.gguf` → `E:\workspace\models\`.
-3. Run (note: port 8080 may be taken — example uses 8090):
+3. Run (note: port 8080 may be taken; example uses 8090):
    `llama-server.exe -m E:\workspace\models\qwen2.5-1.5b-q4km.gguf --port 8090 -c 2048 --jinja`
 4. Point the harness at it and restart:
    `SYNK_LOCAL_MODEL=endpoint`
@@ -24,7 +24,7 @@ dependencies beyond stdlib (`harness/local/model.py: EndpointLocalModel`).
 - First inference is slow (~14 s cold on this box); steady-state is faster.
 - The model must emit `{"decision","ref","text","confidence"}` JSON
   (enforced by system prompt). Malformed output or a down server
-  escalates to cloud/mock — never crashes the loop
+  escalates to cloud/mock and never crashes the loop
   (`harness/local/runtime.py`, covered by `tests/test_local_model.py`).
 - `_normalize_local_decision` (`harness/server.py`) rejects anything
   outside the fixed tool allowlist, so a creative SLM can never invent tools.
