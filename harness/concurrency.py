@@ -197,11 +197,19 @@ class LeaseManager:
     def acquire(self, target: str, intent: str = "", ttl: float = 2.0, *,
                 actor: str = "agent", task_id: str | None = None,
                 action_id: str | None = None,
-                owner_hierarchy: tuple[str, ...] = ()) -> dict | None:
+                owner_hierarchy: tuple[str, ...] = (),
+                nest_under_task_id: str | None = None) -> dict | None:
         """Atomically acquire an exclusive lease, or return None.
 
         owner_hierarchy lists ancestor target keys (e.g. ("tab:3",)) that must
         also be free of human ownership / conflicts / foreign agent leases.
+
+        nest_under_task_id: when set, an ancestor held AGENT_OWNED by a lease
+        whose record carries the SAME task_id is allowed (nested action
+        lease under the task's own tab lease, e.g. the Stage G scheduler
+        holds "tab:t1" for task X while the transaction engine reserves
+        per-action leases for X's actions). Anything else holding the
+        ancestor (human, conflict, another task) still refuses.
         """
         ttl = _clamp_ttl(ttl)
         with self._lock:
@@ -213,6 +221,14 @@ class LeaseManager:
                 if st in (HUMAN_OWNED, CONFLICT):
                     return None
                 if st == AGENT_OWNED:
+                    if nest_under_task_id is not None:
+                        holder_lease_id = self.ownership.owner_of(
+                            ancestor).get("lease")
+                        holder = self.leases.get(holder_lease_id) \
+                            if holder_lease_id else None
+                        if holder is not None and \
+                                holder.get("task_id") == nest_under_task_id:
+                            continue  # same task: nested lease allowed
                     return None  # ancestor exclusively held: do not nest
             state = self.ownership.state_of(target)
             if state in (HUMAN_OWNED, CONFLICT, AGENT_OWNED):

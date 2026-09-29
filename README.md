@@ -93,6 +93,24 @@ planner — the prototype works fully offline.
 | POST | `/agent/status` | task state: steps used/remaining, verified count, replans, history |
 | POST | `/agent/observe` | OBSERVE only: change flags (navigation, modal, human interference) without planning |
 
+## Stage G endpoints (new): scheduler, workflows, router, compiler
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | `/task/submit` | `{goal, spec\|actions, tab_id, depends_on, budgets, requirements, origin, ...}` → enqueue on the SEQUENTIAL scheduler (spec compiled first; typed 400 on compile errors) |
+| POST | `/task/poll` | `{task_id}` → task status, budgets, routing decision, result |
+| POST | `/task/cancel` | `{task_id}` → cancel a queued/blocked task; flag a running one |
+| POST | `/task/run` | dispatch the next ready task through the execution gateway (per-action verification); a task completes only when its transaction COMMITTED |
+| POST | `/compile` | `{spec}` → validated action plan (capability + policy checked); typed `CompileError` on failure (legacy `{intent, slots}` still accepted) |
+| GET | `/workflows/learned` | list workflows learned from verified transactions |
+| POST | `/workflows/get` | `{name}` → one workflow with params, defaults, provenance |
+| POST | `/workflows/suggest` | `{goal, top_n}` → deterministic matches with recorded rationale |
+| POST | `/workflows/learn` | `{task_id, goal, domain}` → learn from a recorded verified transaction report |
+| POST | `/workflows/replay` | `{name, params, tab_id, ...}` → render params and execute through the gateway with per-action verification |
+| GET | `/models` | the configured model registry (source, backends, declared capabilities) |
+| POST | `/route` | `{requirements, task_id}` → deterministic capability-based routing decision |
+
+Model registry configuration: `SYNK_MODELS` (JSON list) or `SYNK_MODELS_FILE` (path to JSON). Without either, the router reports a single built-in default backend and says so.
+
 ## Key advances
 
 ### Alpha (✓)
@@ -154,6 +172,16 @@ Labels: `CdpModelContextTransport` and the probe JS are REAL code paths (UNVERIF
 36. **Least privilege** — REAL: extension manifest reduced to `activeTab` + the local harness host permission (unused `scripting`/`storage` removed); no `eval`/`exec`/`subprocess`/`os.system`/`pickle.loads` anywhere in the execution path (regression-scanned in tests); `__import__("os")` replaced with a normal import; one canonical origin form shared by policy, registry, and WebMCP gateway. See `SECURITY.md` for the full model and residual risks.
 
 Stage F labels: the policy engine, quarantine, schema validation, principal binding, memory redesign, and permission minimization are REAL and covered by `tests/test_stage_f.py` (62 tests). PARTIAL: injection quarantine and secret redaction are pattern-based and can miss novel phrasing/formats (documented in `SECURITY.md` §7). UNVERIFIED: live-browser WebMCP (unchanged from Stage E); memory is not encrypted at rest.
+
+### Stage G (✓): honest scheduler + workflow learning + model routing + task compiler
+
+37. **SEQUENTIAL task scheduler** (`harness/task_scheduler.py`, Phase 9) — REAL: task submission, status query, cancellation, per-task budgets (`max_steps` enforced at submit, `max_seconds` enforced around dispatch), dependency gating, and lease-aware dispatch (a task only starts when its tab lease is free; otherwise it waits `blocked` with a recorded reason). The old `ParallelScheduler` claimed parallelism it never executed; it is kept for import compatibility only, and `/task/*` now runs on the honest scheduler. Concurrency decision: SEQUENTIAL only. The browser runtimes, ToolExecutor, AgentLoop, and server STATE are not thread-safe, so a LIMITED parallel mode would be a lie; real concurrency would need per-tab thread-safe runtimes with isolated CDP sessions (the lease system, the dispatch gate, already exists).
+38. **Lease nesting contract** — REAL: the scheduler holds `tab:<id>` for the running task; the transaction engine's per-action leases nest under it only for the same task id (`LeaseManager.acquire(..., nest_under_task_id=...)`). Actions from any other task, the human, or a conflict still refuse. Covered by regression tests.
+39. **Workflow learning from verified transactions** (`harness/workflow_store.py`, Phase 13) — REAL: `WorkflowLearner` records only action sequences whose every verification result is VERIFIED (COMMITTED transactions auto-learn; anything else never enters the store). Steps are parameterized (`text`/`value`/`url` → `{{p0}}` with recorded defaults); re-observing a shape bumps counts instead of duplicating. `suggest` scores deterministically (term coverage + confidence + success count) and records its rationale; `replay` renders params and executes through the execution gateway with per-action verification, never blindly. Endpoints: `/workflows/learned`, `/workflows/get`, `/workflows/suggest`, `/workflows/learn`, `/workflows/replay`.
+40. **Capability-based model router** (`harness/model_router.py`, Phase 14) — REAL: the registry is operator-declared (`SYNK_MODELS` JSON or `SYNK_MODELS_FILE`); entries carry capabilities, declared context size, and an operator-declared cost tier (no benchmark numbers invented anywhere). Routing is deterministic: required-capability coverage first, then context for long-horizon tasks, then cost, then name. No eligible backend refuses loudly instead of picking a bad one. With a single configured backend the router says so and routes to it. The scheduler records the routing decision per task. Endpoints: `GET /models`, `POST /route`.
+41. **Validating task compiler** (`harness/compiler.py`, Phase 5) — REAL: structured-dict specs only (free text is rejected with `SCHEMA_INVALID`); every action is validated against the capability registry, per-tool required args, `key == value` preconditions, and the known postcondition kinds before the plan is returned. With a policy registry configured, each action is policy-checked at compile time (unknown origins and denied classes fail with typed `POLICY_DENIED`/`CONSENT_REQUIRED`); without one the plan is honestly flagged `policy_checked: false`. Compilation failures are typed `CompileError`s, never silent drops. `/compile` now returns 400 with the typed error; compiled plans enter the scheduler via `/task/submit`'s `spec` field.
+
+Stage G labels: scheduler, lease nesting, workflow learning, model router, and compiler are REAL and covered by `tests/test_stage_g.py` (43 tests). PARTIAL: workflow parameterization names params positionally (`p0`, `p1`) rather than semantically; the router's cost tiers are operator-declared, not measured. UNVERIFIED: no live-browser run (task execution through the gateway was verified against the real transaction engine; end-to-end browser execution remains Stage D's noted gap).
 
 Honest limitations (not hidden):
 - No real Chrome/CDP session was available in the build environment: browser behavior was validated through a deterministic fake backend (67 tests in `tests/test_stage_d.py`) plus syntax and contract checks. The Playwright adapter's real-browser integration (launch, attach, crash hooks, frame walking) is implemented but UNVERIFIED against a live browser.

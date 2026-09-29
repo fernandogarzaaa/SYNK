@@ -18,7 +18,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
 from .benchmarks import suite as bench_suite
-from .compiler import compile_intent, ir_to_actions
 from .concurrency import (LeaseManager,
                               OwnershipGraph, TransactionRunner)
 from .context_manager import ContextManager
@@ -35,6 +34,10 @@ from .workflows import WorkflowMemory, WorkflowMiner, classify
 from .world_state import WorldState
 from .local.runtime import LocalRuntime
 from .scheduler.scheduler import ParallelScheduler
+from .task_scheduler import TaskScheduler
+from .workflow_store import WorkflowLearner
+from .model_router import ModelRegistry, ModelRouter
+from .compiler import compile_spec, CompileError, ir_to_actions
 from .verification.verifier import Verifier
 from .verification.claims import Claim
 from .verification.evidence import (
@@ -177,8 +180,24 @@ class State:
         self.tools.webmcp_gateway = self.webmcp_gateway
         # Beta.2: Local Intelligence Runtime
         self.local_runtime = LocalRuntime()
-        # Beta.3: Parallel Scheduler
+        # Beta.3: Parallel Scheduler (legacy: plan-only, synchronous, kept
+        # for import compatibility; new code uses task_scheduler below)
         self.scheduler = ParallelScheduler(self.ownership)
+        # Stage G: honest SEQUENTIAL task scheduler (Phase 9). Tasks run
+        # one at a time through the execution gateway with per-action
+        # verification; the scheduler never claims concurrency.
+        self.task_scheduler = TaskScheduler(self.leases)
+        # Stage G: workflow learner (Phase 13). Learns parameterized
+        # workflows only from fully-verified transactions.
+        wf_db = ":memory:" if db_path == ":memory:" \
+            else str(db_path) + ".workflows"
+        self.workflow_learner = WorkflowLearner(wf_db)
+        # Stage G: capability-based model router (Phase 14). Registry from
+        # SYNK_MODELS / SYNK_MODELS_FILE; a bad registry fails loudly here.
+        self.model_router = ModelRouter(ModelRegistry.from_env())
+        # Stage G: recent gateway reports (bounded) so /workflows/learn can
+        # learn from a verified transaction by task id.
+        self.recent_reports: dict = {}
         # Beta.2 Truth Layer: Independent Verifier
         self.verifier = Verifier(self.world)
         self.tools.verifier = self.verifier
@@ -363,6 +382,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"levels": STATE.ladder.describe()})
         if path == "/workflows":
             return self._send(200, {"workflows": STATE.wfmem.all_workflows()})
+        # Stage G: learned workflows (Phase 13) + model registry (Phase 14).
+        if path == "/workflows/learned":
+            return self._send(200, {"ok": True,
+                                    "workflows": STATE.workflow_learner.list()})
+        if path == "/models":
+            return self._send(200, {"ok": True,
+                                    **STATE.model_router.registry.to_dict()})
         # Stage F: origin policy registry (default-deny). Operators must
         # register an origin before the agent may act on it.
         if path == "/policy":
@@ -407,9 +433,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._lease(b)
         if path == "/estop":
             return self._estop(b)
+        # Stage G: validating task compiler (Phase 5). Accepts {"spec": {...}}
+        # (preferred) or the legacy {"intent", "slots"}. Every action is
+        # validated against the capability registry and the origin policy
+        # BEFORE the plan is returned; failures are typed CompileErrors.
         if path == "/compile":
-            ir = compile_intent(b.get("intent", ""), b.get("slots", {}))
-            return self._send(200, {"ir": ir, "actions": ir_to_actions(ir)})
+            spec = b.get("spec")
+            if spec is None:
+                spec = {"task": b.get("intent", ""),
+                        **(b.get("slots") or {})}
+            try:
+                plan = compile_spec(spec, policy=STATE.policy,
+                                    task_id=b.get("task_id", "compile"))
+            except CompileError as e:
+                return self._send(400, e.to_dict())
+            return self._send(200, {"ok": True, "plan": plan,
+                                    "actions": ir_to_actions(plan)})
         if path == "/human":
             STATE.tools.set_human_active(bool(b.get("active", True)))
             return self._send(200, {"paused_for_user": STATE.tools.paused_for_user})
@@ -459,39 +498,141 @@ class Handler(BaseHTTPRequestHandler):
             tier, reason = pick_tier(b.get("intent", ""), workflow_matched=prep["matched"])
             return self._send(200, {"preparation": prep, "tier": tier,
                                     "tier_reason": reason})
+        # Stage G: learned-workflow family (Phase 13). These workflows are
+        # recorded only from fully-verified transactions (see
+        # _record_task_report) and replayed through the execution gateway
+        # with per-action verification, never blindly.
+        if path == "/workflows/learned":
+            return self._send(200, {"ok": True,
+                                    "workflows": STATE.workflow_learner.list()})
+        if path == "/workflows/get":
+            w = STATE.workflow_learner.get(b.get("name", ""))
+            if w is None:
+                return self._send(404, {"ok": False, "error": "not found"})
+            return self._send(200, {"ok": True, "workflow": w})
+        if path == "/workflows/suggest":
+            sugg = STATE.workflow_learner.suggest(
+                b.get("goal", ""), top_n=int(b.get("top_n", 3) or 3))
+            return self._send(200, {"ok": True, "suggestions": sugg})
+        if path == "/workflows/learn":
+            rec = STATE.recent_reports.get(b.get("task_id", ""))
+            if rec is None:
+                return self._send(404, {"ok": False,
+                                        "error": "no recorded report for "
+                                                 "task_id"})
+            learned = STATE.workflow_learner.learn_verified_pairs(
+                rec["pairs"], goal=b.get("goal") or rec.get("goal", ""),
+                domain=b.get("domain", ""), origin=rec.get("origin", ""),
+                session_id=rec.get("session_id"),
+                task_id=b.get("task_id"))
+            code = 200 if learned.get("learned") else 422
+            return self._send(code, learned)
+        if path == "/workflows/replay":
+            name = b.get("name", "")
+            try:
+                actions = STATE.workflow_learner.render(
+                    name, b.get("params"))
+            except KeyError as e:
+                return self._send(404, {"ok": False, "error": str(e)})
+            result = STATE.gateway.execute({
+                "actions": actions, "task_id": f"wf_{name}",
+                "tab_id": b.get("tab_id", "default"),
+                "session_id": b.get("session_id"),
+                "window_id": b.get("window_id", "win_default"),
+                "frame_id": b.get("frame_id", "main"),
+                "page_url": b.get("page_url", ""),
+                "user_consented": bool(b.get("user_consented", False)),
+            })
+            result["ok"] = (result.get("transaction_status") == "COMMITTED")
+            return self._send(200, {"ok": result["ok"], "workflow": name,
+                                    "rendered_actions": actions,
+                                    "engine_result": result})
+        # Stage G: model registry + capability router (Phase 14).
+        if path == "/models":
+            return self._send(200, {"ok": True,
+                                    **STATE.model_router.registry.to_dict()})
+        if path == "/route":
+            decision = STATE.model_router.route(b.get("requirements") or {},
+                                                task_id=b.get("task_id"))
+            return self._send(200, dict(decision))
         if path == "/benchmark":
             return self._send(200, _run_benchmarks())
-        # Beta.3: Parallel Task Submission + plan-only execution
+        # Stage G: honest SEQUENTIAL task queue (Phase 9). /task/submit
+        # enqueues (compiling "spec" first when present, with typed errors);
+        # /task/run dispatches the next ready task through the execution
+        # gateway with per-action verification; /task/poll and /task/cancel
+        # query and cancel. Tasks run one at a time; a task only starts
+        # when its tab lease is free.
         if path == "/task/submit":
-            tid = b.get("task_id", "t1")
-            tab = b.get("tab_id", "default")
-            intent = b.get("intent", "")
-            deps = set(b.get("dependencies", []))
+            spec = {
+                "task_id": b.get("task_id"),
+                "goal": b.get("goal") or b.get("intent", ""),
+                "tab_id": b.get("tab_id", "default"),
+                "session_id": b.get("session_id"),
+                "window_id": b.get("window_id", "win_default"),
+                "frame_id": b.get("frame_id", "main"),
+                "page_url": b.get("page_url", ""),
+                "origin": b.get("origin"),
+                "user_consented": bool(b.get("user_consented", False)),
+                "spec": b.get("spec"),
+                "actions": b.get("actions"),
+                "depends_on": b.get("depends_on")
+                or b.get("dependencies") or [],
+                "budgets": b.get("budgets") or {},
+                "requirements": b.get("requirements") or {},
+            }
             try:
-                STATE.scheduler.submit(tid, tab, intent, deps)
+                task = STATE.task_scheduler.submit(
+                    spec, policy=STATE.policy, router=STATE.model_router)
+            except CompileError as e:
+                return self._send(400, e.to_dict())
             except ValueError as e:
                 return self._send(409, {"ok": False, "error": str(e)})
-            return self._send(200, {"ok": True, "task_id": tid,
-                                    "ready": len(STATE.scheduler.get_ready_tasks())})
+            return self._send(200, {"ok": True, **task.to_dict()})
         if path == "/task/poll":
             tid = b.get("task_id", "t1")
-            task = STATE.scheduler.tasks.get(tid)
-            if not task: return self._send(404, {"error": "not found"})
-            return self._send(200, {"status": task.status, "result": task.result,
-                                    "tab_id": task.tab_id,
-                                    "dependencies": sorted(task.dependencies)})
+            st = STATE.task_scheduler.status(tid)
+            code = 200 if st.get("ok") else 404
+            return self._send(code, st)
+        if path == "/task/cancel":
+            tid = b.get("task_id", "")
+            ok = STATE.task_scheduler.cancel(tid)
+            body = {"ok": ok, "task_id": tid, "cancelled": ok}
+            if ok:
+                body["task"] = STATE.task_scheduler.status(tid)
+            return self._send(200, body)
         if path == "/task/run":
-            def _plan_task(task):
-                prompt = STATE.ctx.prompt_for_tab(task.intent, task.tab_id,
-                                                  STATE.mem.summary_for_prompt())
-                prompt += "\n" + STATE.world.prompt_section()
-                plan = STATE.llm.plan(task.intent, STATE.safety.mask_pii(prompt),
-                                      STATE.mem.summary_for_prompt())
-                return {"intent": task.intent, "tab_id": task.tab_id, "plan": plan}
-            ran = STATE.scheduler.run_ready(_plan_task)
-            return self._send(200, {"ok": True,
-                                    "ran": [{"task_id": t.task_id, "status": t.status,
-                                             "tab_id": t.tab_id} for t in ran]})
+            def _exec(task):
+                if STATE.task_scheduler.cancel_requested(task["task_id"]):
+                    return {"ok": False, "cancelled": True,
+                            "error": "cancel requested"}
+                actions = task.get("actions") or []
+                if not actions:
+                    return {"ok": False,
+                            "error": "no_actions: task has no compiled "
+                                     "actions; submit with 'spec' or "
+                                     "'actions'"}
+                result = STATE.gateway.execute({
+                    "actions": actions, "task_id": task["task_id"],
+                    "tab_id": task["tab_id"],
+                    "session_id": task.get("session_id"),
+                    "window_id": task.get("window_id", "win_default"),
+                    "frame_id": task.get("frame_id", "main"),
+                    "page_url": task.get("page_url", ""),
+                    "user_consented": task.get("user_consented", False),
+                })
+                # A task completes only when its whole transaction
+                # COMMITTED (every action verified). Partial commits mark
+                # the task failed with the partial report attached.
+                result["ok"] = (result.get("transaction_status")
+                                == "COMMITTED")
+                self._record_task_report(task, result)
+                return result
+            ran = STATE.task_scheduler.run_next(_exec)
+            if ran is None:
+                return self._send(200, {"ok": True, "ran": None,
+                                        "note": "no dispatchable task"})
+            return self._send(200, {"ok": True, "ran": ran})
         # Beta.2 Truth Layer endpoints
         if path == "/verification/claim":
             from .verification.claims import Claim
@@ -968,6 +1109,37 @@ class Handler(BaseHTTPRequestHandler):
         STATE.leases.clear_emergency()
         STATE.bus.emit("agent.estop", {"active": False})
         return self._send(200, {"ok": True, "emergency_stop": False})
+
+    # Stage G: keep a bounded store of gateway reports per task so
+    # /workflows/learn can learn from a verified transaction, and
+    # auto-learn workflows from fully-COMMITTED task transactions.
+    # COMMITTED means every action independently verified (see
+    # TransactionEngine._aggregate), so only genuinely verified work is
+    # ever learned.
+    def _record_task_report(self, task: dict, result: dict) -> None:
+        actions = task.get("actions") or []
+        action_results = result.get("action_results") or []
+        pairs = [(a, (ar.get("verification") or {}))
+                 for a, ar in zip(actions, action_results)]
+        STATE.recent_reports[task["task_id"]] = {
+            "task_id": task["task_id"], "goal": task.get("goal", ""),
+            "origin": task.get("origin", ""), "domain": task.get("origin", ""),
+            "session_id": task.get("session_id"), "pairs": pairs,
+            "transaction_status": result.get("transaction_status"),
+        }
+        while len(STATE.recent_reports) > 50:
+            oldest = next(iter(STATE.recent_reports))
+            STATE.recent_reports.pop(oldest, None)
+        if result.get("transaction_status") == "COMMITTED" and pairs:
+            try:
+                STATE.workflow_learner.learn_verified_pairs(
+                    pairs, goal=task.get("goal", ""),
+                    domain=task.get("origin", ""),
+                    origin=task.get("origin", ""),
+                    session_id=task.get("session_id"),
+                    task_id=task["task_id"])
+            except Exception:
+                pass  # learning never breaks execution
 
     def _workflow_observe(self, b: dict):
         steps = b.get("steps", [])
