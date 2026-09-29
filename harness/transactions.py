@@ -561,7 +561,12 @@ class TransactionEngine:
             target, action.get("intent", ""),
             ttl=_bounded(float(action.get("lease_ttl", 2.0)), 0.1, 30.0),
             actor="agent", task_id=req.task_id,
-            action_id=req.action_id, owner_hierarchy=hierarchy)
+            action_id=req.action_id, owner_hierarchy=hierarchy,
+            # Stage G: an action may nest under its own task's tab lease
+            # (the scheduler holds "tab:<id>" for the task while the
+            # engine reserves per-action leases). Foreign holders still
+            # refuse.
+            nest_under_task_id=req.task_id)
 
     @staticmethod
     def _classify_tool_error(res: dict, tool: str) -> tuple[str, str]:
