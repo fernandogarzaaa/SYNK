@@ -180,11 +180,15 @@ fail-closed outcome:
 - Classic prompt injection in snapshot node names and tool
   descriptions: quarantined; the planner sees a placeholder; the audit
   trail keeps ids + markers, never the hostile payload.
-- Unicode-obfuscated injection (Cyrillic homoglyphs, zero-width
-  spaces, fullwidth Latin): **not** caught by the regex classifier
-  (documented limit); the architectural invariant still holds, page
-  strings can never be dispatched as tool calls (`TOOL_NOT_FOUND`
-  fail-closed).
+- Unicode-obfuscated injection (Cyrillic/Greek homoglyphs,
+  zero-width characters, fullwidth Latin): caught by the hardened
+  classifier, which additionally scans an NFKC-normalized view of
+  each page string with invisible characters stripped and
+  confusables folded to Latin; text carrying zero-width/invisible
+  characters is flagged even when no pattern matches. Quarantined
+  like classic injection; the architectural invariant still holds,
+  page strings can never be dispatched as tool calls
+  (`TOOL_NOT_FOUND` fail-closed).
 - Secrets smuggled in tool results: redacted; oversized results
   truncated; results are evidence, never re-dispatched.
 - WebMCP inputs violating declared schemas: rejected; malformed tool
@@ -221,10 +225,17 @@ Stated plainly; nothing here is presented as done:
    consistency, and a full vite production build. `cargo check` and the
    packaged app remain CI-verified only. The shell is labeled
    EXPERIMENTAL.
-3. **Unicode-obfuscation bypasses the injection classifier** (see
-   section 5). The regex list catches known ASCII patterns; homoglyph
-   and zero-width variants do not match. Mitigation is architectural
-   (page text is never instruction), not detection-based.
+3. **Unicode-obfuscation detection is pattern-bound, not
+   universal** (see section 5). The hardened classifier catches
+   NFKC-foldable forms (fullwidth Latin), the listed
+   zero-width/invisible characters, and Cyrillic/Greek homoglyphs
+   from its confusable map when they spell a known injection
+   pattern. Still out of scope: homoglyphs outside the map (for
+   example Cherokee or Armenian lookalikes), invisible codepoints
+   not in the list, obfuscated phrasings that match no known
+   pattern, and visual-only attacks (text rendered in images).
+   Mitigation remains architectural as well: page text is never
+   instruction, regardless of detection.
 4. **The planner is a local heuristic, not a model.** Cloud planning
    requires operator-configured credentials (`docs/local-models.md`);
    the mock planner path is labeled as such wherever it appears.
