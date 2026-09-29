@@ -1,22 +1,27 @@
-"""WebMCP Adapter: executes WebMCP tools through the harness safety/policy pipeline.
+"""WebMCP Adapter: LEGACY direct-execution path (pre-Stage E).
 
-The adapter is NOT a direct passthrough. It:
-1. Normalizes the WebMCP tool as a Capability
-2. Runs ownership/conflict/policy checks
-3. Executes the tool call (in production: via Chrome WebMCP/CDP)
-4. Verifies the result
+Stage E introduced the real WebMCPGateway (harness/webmcp/gateway.py),
+which discovers tools from the live page's model context per tab/session.
+This adapter is preserved for two honest uses only:
+
+* the legacy ``/webmcp/execute`` endpoint (responses are labeled PARTIAL),
+* the benchmark harness (``benchmark/agents.py``), which measures the
+  ladder's WebMCP fast path against fixtures.
+
+Its ``_execute_tool`` answers from the built-in fixture table -- it never
+touches a page. Do not use it for production agent execution; route
+through ``WebMCPGateway`` instead.
 """
 from __future__ import annotations
 
-import json
-import time
 import uuid
 from typing import Any
 
-from .schema import ToolCall, ToolResult, WebMCPTool, WebMCPSite
+from .schema import ToolResult, WebMCPSite
 from .discovery import WebMCPDiscovery
+from .fallback import LEGACY_FALLBACK_TABLE
 from .registry import REGISTRY, Capability
-from .policy import PolicyEngine, CAPABILITY_POLICY, PolicyDecision
+from .policy import PolicyEngine, CAPABILITY_POLICY
 from ..concurrency import LeaseManager, OwnershipGraph
 from ..safety import SafetyLayer
 
@@ -84,23 +89,18 @@ class WebMCPAdapter:
         return result
 
     def _execute_tool(self, origin: str, tool_name: str, args: dict) -> ToolResult:
-        """Execute the WebMCP tool. Mock implementation for prototype."""
+        """Execute the WebMCP tool.
+
+        LEGACY/PARTIAL: answers from the built-in fixture table; it never
+        touches a page. Real execution goes through WebMCPGateway.
+        """
         request_id = uuid.uuid4().hex[:8]
 
-        # Simulate tool execution
-        mock_results = {
-            "searchProducts": {"products": [{"id": "1", "name": "MacBook Pro", "price": 1999}]},
-            "getProductDetails": {"product": {"id": "1", "name": "MacBook Pro", "price": 1999, "specs": "M3, 16GB"}},
-            "addToCart": {"cart": {"items": [{"product_id": "1", "quantity": 1}], "total": 1999}},
-            "checkout": {"order_id": "ord_123", "status": "confirmed", "total": 1999},
-            "deleteAccount": {"deleted": True},
-            "searchCustomers": {"customers": [{"id": "c1", "name": "John Doe", "email": "john@example.com"}]},
-            "getCustomer": {"customer": {"id": "c1", "name": "John Doe", "email": "john@example.com"}},
-            "updateCustomer": {"customer": {"id": "c1", "name": "John Doe", "email": "jane@example.com"}},
-        }
-
-        if tool_name in mock_results:
-            return ToolResult(request_id, True, result=mock_results[tool_name])
+        # Fixture table (see harness/webmcp/fallback.py): simulated tool
+        # execution for the legacy endpoint and benchmarks only.
+        if tool_name in LEGACY_FALLBACK_TABLE:
+            return ToolResult(request_id, True,
+                              result=dict(LEGACY_FALLBACK_TABLE[tool_name]))
         return ToolResult(request_id, False, error=f"unknown tool: {tool_name}")
 
     def _verify_result(self, cap: Capability, result: ToolResult) -> bool:

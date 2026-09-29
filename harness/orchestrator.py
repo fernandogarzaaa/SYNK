@@ -360,8 +360,14 @@ class AgentLoop:
             return self._map_prepare_failure(ctx, ex)
         prepared = ex.request.action  # carries lease, action_id, ref_version
         action_id = ex.request.action_id
+        # Stage E: store the ACTUAL lease key. DOM actions lease their
+        # element target; webmcp_invoke leases its tool handle. Releasing
+        # a DOM-style target for a WebMCP action would release "None"
+        # and leak the real lease.
+        from .transactions import _lease_target_for
         ctx.pending_execs[action_id] = {
             "lease_id": ex.lease_id,
+            "lease_target": _lease_target_for(prepared, ctx.tab_id),
             "target": prepared.get("target", prepared.get("selector",
                         prepared.get("ref"))),
             "claim_id": ex.claim_id,
@@ -385,7 +391,8 @@ class AgentLoop:
                claim_id: str | None, status: str,
                error_code: str | None = None,
                reason: str | None = None,
-               browser_ack: dict | None = None) -> dict:
+               browser_ack: dict | None = None,
+               webmcp_result: dict | None = None) -> dict:
         """OBSERVE (already ingested by the caller) -> VERIFY -> DECIDE.
 
         status: "executed" (browser ran the command; re-verify the claim
@@ -397,6 +404,13 @@ class AgentLoop:
         BROWSER_ACK evidence -- audit trail only; it can NEVER satisfy a
         postcondition. Only independent observation can move the claim to
         VERIFIED.
+
+        webmcp_result: the page's own model-context tool report for a
+        webmcp_invoke action (Stage E). Validated (fail closed on a tool
+        the page never advertised) and recorded as WEBMCP_RESULT
+        evidence, which is what a webmcp_result postcondition verifies
+        against. A report flagged partial_fallback is recorded honestly
+        and refused by the verifier outright.
         """
         from .verification.results import (VERIFIED, FAILED, UNVERIFIED,
                                            CONFLICTING)
@@ -416,8 +430,11 @@ class AgentLoop:
         pend = ctx.pending_execs.pop(action_id, None) if action_id else None
         if pend:
             try:
-                self.state.leases.release(str(pend.get("target", "?")),
-                                          pend.get("lease_id"))
+                # Release the exact lease key acquired at prepare time.
+                self.state.leases.release(
+                    str(pend.get("lease_target")
+                        or pend.get("target", "?")),
+                    pend.get("lease_id"))
             except Exception:
                 pass
             if not claim_id:
@@ -451,6 +468,17 @@ class AgentLoop:
         if status == "browser_failed":
             ctx.consecutive_failures += 1
             ctx.note("browser_failed", reason or "")
+            # Stage E: a failed WebMCP invocation still carries the
+            # page's own tool report (ok=False). Record it as
+            # WEBMCP_RESULT evidence BEFORE returning: the failure is
+            # what the page said, and the audit trail must show it. A
+            # rejected report turns into a replan with the reason.
+            if webmcp_result is not None:
+                webmcp_note = self._record_webmcp_result(
+                    ctx, action_id, claim_id, webmcp_result)
+                if webmcp_note is not None:
+                    return {"decision": "replan",
+                            "reason": f"webmcp report rejected: {webmcp_note}"}
             if ctx.consecutive_failures > 3:
                 ctx.status = "waiting_human"
                 return {"decision": "request-human",
@@ -474,6 +502,17 @@ class AgentLoop:
                 ctx.note("browser_failed", ack_note)
                 return {"decision": "replan",
                         "reason": f"browser execution failed: {ack_note}"}
+        # Stage E: the page's own model-context tool report. Validated and
+        # recorded as WEBMCP_RESULT evidence BEFORE the verifier judges the
+        # claim; a report for a tool the claim never named is rejected.
+        if webmcp_result is not None:
+            webmcp_note = self._record_webmcp_result(ctx, action_id,
+                                                     claim_id, webmcp_result)
+            if webmcp_note is not None:
+                ctx.consecutive_failures += 1
+                ctx.note("browser_failed", webmcp_note)
+                return {"decision": "replan",
+                        "reason": f"webmcp report rejected: {webmcp_note}"}
         if claim_id:
             self._record_state_observation(ctx, claim_id, action_id)
             result = self.state.verifier.verify(claim_id)
@@ -549,7 +588,54 @@ class AgentLoop:
         plan["execution_reason"] = level_reason
         ctx.note("plan", f"model={plan.get('model')} "
                          f"actions={len(plan.get('actions') or [])}")
+        # Stage E: WebMCP selection. When the planner found no DOM path
+        # (its ask_user/snapshot fallbacks), try the page's advertised
+        # model-context tools. Deterministic selection picks a winner and
+        # its full rationale is preserved on the action and in the task
+        # notes. No winner -> the planner's fallback stands, never a
+        # silent substitution.
+        actions = plan.get("actions") or []
+        if actions and all(a.get("tool") in ("ask_user", "snapshot")
+                           for a in actions):
+            try:
+                sel = self._select_webmcp_action(ctx)
+            except Exception:
+                sel = None
+            if sel is not None:
+                plan["actions"] = [sel]
+                plan["webmcp_selection"] = sel.get("webmcp_selection")
         return plan
+
+    def _select_webmcp_action(self, ctx) -> dict | None:
+        """Deterministic WebMCP tool choice for a goal (Stage E).
+
+        Returns a webmcp_invoke action carrying the full selection
+        record, or None when the page advertises nothing usable. The
+        gateway enforces all identity guards; missing tools fail closed
+        before any action is built.
+        """
+        gateway = getattr(self.state, "webmcp_gateway", None)
+        if gateway is None:
+            return None
+        try:
+            scope = gateway.scope_for(ctx.session_id, ctx.tab_id,
+                                      ctx.frame_id)
+        except ValueError:
+            return None
+        result = gateway.discover(scope)
+        if not result.get("available") or not result.get("tools"):
+            return None
+        record = gateway.select(ctx.goal, scope)
+        if not record.winner:
+            return None
+        ctx.note("webmcp_selection",
+                 f"winner={record.winner} "
+                 f"rationale={record.rationale}")
+        return {"tool": "webmcp_invoke",
+                "tool_name": record.winner,
+                "args": {},
+                "intent": ctx.goal,
+                "webmcp_selection": record.to_dict()}
 
     @staticmethod
     def _prep_sub(a: dict, ctx: TaskExecutionContext, i: int,
@@ -646,6 +732,65 @@ class AgentLoop:
                  f"error={ack.get('error_code') or ack.get('error')}")
         return None
 
+    def _record_webmcp_result(self, ctx, action_id: str | None,
+                              claim_id: str | None,
+                              rec: dict) -> str | None:
+        """Validate a page model-context tool report and record it.
+
+        Returns None when accepted, or a failure reason when the report is
+        malformed or mismatched (caller then treats the execution as
+        failed). Rules, fail closed:
+
+        - the report must name the tool the claim's postcondition names
+          (a report for a tool the page never advertised is rejected);
+        - the report must carry the task's tab identity;
+        - the ok field must be a real boolean.
+
+        The report is recorded as WEBMCP_RESULT evidence: the page's own
+        tool outcome IS the independent observation for a webmcp_result
+        postcondition. A report flagged partial_fallback is recorded with
+        the flag intact -- the verifier refuses such evidence outright.
+        """
+        if not isinstance(rec, dict) or not rec.get("tool"):
+            return "malformed webmcp report: no tool name"
+        if not isinstance(rec.get("ok"), bool):
+            return "malformed webmcp report: ok is not a boolean"
+        if rec.get("tab_id") and str(rec.get("tab_id")) != str(ctx.tab_id):
+            return (f"webmcp report tab mismatch: {rec.get('tab_id')} != "
+                    f"{ctx.tab_id}")
+        if claim_id:
+            claim = self.state.verifier.claims_store.get(claim_id)
+            pc = (claim.postcondition or {}) if claim else {}
+            want = pc.get("tool_name")
+            if want and rec.get("tool") != want:
+                return (f"webmcp report tool mismatch: {rec.get('tool')!r} "
+                        f"!= claimed {want!r}")
+        from .verification.evidence import (WEBMCP_RESULT, Evidence,
+                                            strength_of)
+        import time as _time
+        import uuid as _uuid
+        self.state.verifier.record_evidence(Evidence(
+            evidence_id=f"e_{_uuid.uuid4().hex[:8]}",
+            evidence_type=WEBMCP_RESULT,
+            source="webmcp", timestamp=_time.time(),
+            action_id=action_id, task_id=ctx.task_id,
+            strength=strength_of(WEBMCP_RESULT),
+            payload={"tool": rec.get("tool"), "ok": rec.get("ok"),
+                     "result": rec.get("result"),
+                     "error": rec.get("error"),
+                     "error_code": rec.get("error_code"),
+                     "partial_fallback": bool(rec.get("partial_fallback")),
+                     "frame_id": rec.get("frame_id"),
+                     "provenance_note": "page model-context tool report: "
+                                        "the page's own outcome, judged by "
+                                        "the verifier"},
+            provenance=("fixture_fallback" if rec.get("partial_fallback")
+                        else "page_model_context")))
+        ctx.note("webmcp_result",
+                 f"{action_id}: tool={rec.get('tool')} ok={rec.get('ok')} "
+                 f"error={rec.get('error_code') or rec.get('error')}")
+        return None
+
     def _record_state_observation(self, ctx: TaskExecutionContext,
                                   claim_id: str,
                                   action_id: str | None) -> None:
@@ -657,8 +802,7 @@ class AgentLoop:
         marked honestly, and the verifier still requires it to satisfy the
         claim's postcondition.
         """
-        from .verification.evidence import (ELEMENT_STATE, Evidence,
-                                            URL_CHANGE)
+        from .verification.evidence import (ELEMENT_STATE, Evidence)
         from .session import new_id as _new_id
         import time as _time
         import uuid as _uuid

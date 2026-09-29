@@ -3,11 +3,11 @@ Implements INV-08 to INV-17: verification must be independent of the acting mode
 """
 from __future__ import annotations
 import time
-from typing import Any, Optional, List, Dict, Tuple
+from typing import List, Dict
 
 from .evidence import (Evidence, DOM_CHANGE, NAVIGATION, URL_CHANGE,
                          WEBMCP_RESULT, BROWSER_EVENT,
-                         satisfies_postcondition, strength_of)
+                         satisfies_postcondition)
 from .claims import Claim
 from .results import VerificationResult, VERIFIED, FAILED, UNVERIFIED, CONFLICTING
 
@@ -45,8 +45,13 @@ class Verifier:
             return VerificationResult(UNVERIFIED, reason="No relevant evidence observed")
 
         # Deterministic evidence check (Preferred Order)
-        # 1. WebMCP Results
-        webmcp_ev = [e for e in relevant_evidence if e.evidence_type == WEBMCP_RESULT]
+        # 1. WebMCP Results. Fixture-fallback evidence (partial_fallback)
+        #    is excluded here exactly as in the postcondition path: a
+        #    fixture result can never verify or fail a claim -- it proves
+        #    nothing about the live page.
+        webmcp_ev = [e for e in relevant_evidence
+                     if e.evidence_type == WEBMCP_RESULT
+                     and not (e.payload or {}).get("partial_fallback")]
         if webmcp_ev:
             # Check the last result
             res = webmcp_ev[-1].payload.get("ok", False)
@@ -135,7 +140,8 @@ class Verifier:
         """
         pc = claim.postcondition or {}
         kind = pc.get("kind")
-        if kind not in ("element_value", "element_interaction", "url"):
+        if kind not in ("element_value", "element_interaction", "url",
+                        "webmcp_result"):
             return VerificationResult(
                 UNVERIFIED,
                 reason=f"unknown postcondition kind {kind!r}; failing closed",
@@ -192,6 +198,13 @@ class Verifier:
                         "confirms the expected value"),
                 timestamp=time.time())
 
+        # webmcp_result (Stage E): the page's own tool report. Checked
+        # BEFORE the generic interaction branch so fixture-fallback
+        # evidence (which shares the WEBMCP_RESULT type) can never
+        # verify through the back door.
+        if kind == "webmcp_result":
+            return self._verify_webmcp_result(pc, appropriate, ids)
+
         # element_interaction: appropriate independent evidence (a DOM/state
         # observation, navigation, or application/human confirmation tied to
         # this claim) is sufficient.
@@ -207,6 +220,49 @@ class Verifier:
             UNVERIFIED, ids,
             reason="appropriate evidence present but not tied to the target",
             timestamp=time.time())
+
+    @staticmethod
+    def _verify_webmcp_result(pc: dict, appropriate: list,
+                              ids: list) -> VerificationResult:
+        """Verify a WebMCP invocation claim (Stage E).
+
+        The page's own model-context tool result is the independent
+        observation: the page reported its own tool outcome. Rules, fail
+        closed:
+
+        * the evidence must name the claimed tool (payload["tool"]);
+        * a fixture-fallback result (payload["partial_fallback"] is True)
+          can NEVER verify -- it proves nothing about the live page;
+        * ok=True with no contradiction -> VERIFIED;
+        * ok=False -> FAILED (the tool ran and reported failure -- this is
+          a verification failure, not an execution failure);
+        * no page-reported result at all -> UNVERIFIED.
+        """
+        want_tool = pc.get("tool_name")
+        real = [e for e in appropriate
+                if not (e.payload or {}).get("partial_fallback")]
+        if want_tool:
+            real = [e for e in real
+                    if (e.payload or {}).get("tool") == want_tool]
+        if not real:
+            return VerificationResult(
+                UNVERIFIED, ids,
+                reason=(f"no page-reported tool result for "
+                        f"'{want_tool or '?'}' (fixture results excluded)"),
+                timestamp=time.time())
+        last = real[-1]
+        payload = last.payload or {}
+        if payload.get("ok") is True:
+            return VerificationResult(
+                VERIFIED, [e.evidence_id for e in real],
+                reason=(f"page model-context tool '{want_tool}' reported "
+                        f"success"),
+                confidence=0.9, timestamp=time.time())
+        return VerificationResult(
+            FAILED, [last.evidence_id],
+            reason=(f"tool '{want_tool}' reported failure: "
+                    f"{payload.get('error') or 'unknown error'}"),
+            confidence=1.0, timestamp=time.time())
 
     def get_evidence_for_task(self, task_id: str) -> List[Evidence]:
         return [e for e in self.evidence_store.values() if e.task_id == task_id]

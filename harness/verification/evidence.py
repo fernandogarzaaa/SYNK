@@ -66,6 +66,12 @@ EVIDENCE_STRENGTH = {
 # Postcondition kind -> evidence types that may satisfy it. Types absent
 # here (BROWSER_EVENT, AGENT_EVENT, BROWSER_ACK, bare SCREENSHOT) can
 # never verify a postcondition, no matter how many are recorded.
+#
+# "webmcp_result" (Stage E): the page's own model-context tool result IS
+# the independent observation for a WebMCP invocation -- the page is a
+# first-class participant reporting its own tool outcome. A fixture-
+# fallback result (payload["partial_fallback"] is True) is excluded by
+# the verifier even though it shares the evidence type.
 POSTCONDITION_EVIDENCE = {
     "element_value": {DOM_CHANGE, ACCESSIBILITY_CHANGE, ELEMENT_STATE,
                       HUMAN_EVENT, APPLICATION_CONFIRMATION},
@@ -73,6 +79,7 @@ POSTCONDITION_EVIDENCE = {
                             URL_CHANGE, NAVIGATION, APPLICATION_CONFIRMATION,
                             HUMAN_EVENT, DIALOG},
     "url": {URL_CHANGE, NAVIGATION, HUMAN_EVENT},
+    "webmcp_result": {WEBMCP_RESULT, HUMAN_EVENT, APPLICATION_CONFIRMATION},
 }
 
 

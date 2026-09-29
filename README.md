@@ -79,9 +79,10 @@ planner — the prototype works fully offline.
 ## Beta.1 WebMCP endpoints (new)
 | Method | Endpoint | Purpose |
 |---|---|---|
-| POST | `/webmcp/discover` | `{origin|url}` → discover site's WebMCP tools |
-| POST | `/webmcp/capabilities` | `{origin?,goal?}` → list capabilities with risk/latency |
-| POST | `/webmcp/execute` | `{origin,tool,args,goal?,user_consented?}` → policy-gated execution |
+| POST | `/webmcp/discover` | `{tab_id, frame_id?, session_id?}` → per-document model-context discovery (Stage E: page-advertised tools only, fail-closed) |
+| POST | `/webmcp/capabilities` | `{goal, tab_id, ...}` → deterministic selection: all candidates, score breakdowns, winner, rationale |
+| POST | `/webmcp/invoke` | `{tool_name\|goal, args, tab_id, ...}` → invocation through the transaction engine: claims, evidence, verification |
+| POST | `/webmcp/execute` | legacy Beta.1 fixture path, kept for compatibility and labeled PARTIAL (never verifies a claim) |
 
 ## Stage C endpoints (new): closed-loop agent
 | Method | Endpoint | Purpose |
@@ -133,11 +134,22 @@ planner — the prototype works fully offline.
 23. **Browser acknowledgements** — the extension's `EXECUTE` handler performs the robust primitive and replies with a `BROWSER_ACK` carrying the observed post-state; the background loop only reports `executed` when the ack says so, and forwards it to `/agent/report`. The server validates the ack (fail closed on `executed=True` without an observation, or on action-id mismatch) and records it as `BROWSER_ACK` evidence: audit trail only, it can NEVER verify a postcondition. Lifecycle: DISPATCHED → BROWSER_ACK → OBSERVED → VERIFIED.
 24. **Frame/document identity** — frames carry parent, frame chain, and the browser's own frame id; document identity is preserved across snapshot events and replaced on navigation (so stale refs fail closed).
 
+### Stage E (✓ implementation; live-browser WebMCP UNVERIFIED)
+25. **Real WebMCP through page-advertised model context** — discovery is per (session, tab, frame, document); only tools the page's own `navigator.modelContext` advertises are invocable. Handles are sha256-derived from the scope (never Python `hash()`), so a cross-tab handle is unaddressable and a post-navigation handle is stale: both fail closed.
+26. **Deterministic capability selection** — `3 * name_hits + desc_hits + schema_bonus` with required-schema-term bonus; ties break by score, risk, then name. `/webmcp/capabilities` returns every candidate, its score breakdown, the winner, and the rationale, all written to the audit trail. Zero-score goals produce no winner, never a silent substitution.
+27. **Invocation through the transaction engine** — `/webmcp/invoke` and the `webmcp_invoke` tool run the same REQUEST → VALIDATE → RESERVE → DISPATCH → OBSERVE → VERIFY lifecycle as DOM actions: schema checks, policy/consent gates, per-action claims, `WEBMCP_RESULT` evidence, and `webmcp_result` postcondition verification. A page-reported `ok=True` verifies; a page-reported failure marks the claim FAILED; fixture results can never verify (the verifier refuses `partial_fallback` evidence outright, in both the postcondition and generic paths).
+28. **Fail-closed missing tools; honest unavailability** — a tool the page did not advertise fails with `WEBMCP_TOOL_NOT_ADVERTISED` (zero transport calls, zero fallback calls, even with opt-in on). No model context reports `webmcp_unavailable`. A model context with zero tools is reported available (not unavailable) and never enables the fallback.
+29. **Opt-in PARTIAL fixture fallback only** — `--webmcp-fallback` wires the legacy fixture table when the page exposes no model context at all; every such result carries the PARTIAL caveat and is labeled PARTIAL wherever it surfaces. The old `/webmcp/execute` endpoint is preserved as this labeled legacy path.
+30. **Closed-loop WebMCP** — the extension probes `navigator.modelContext` per page (sync or async listings, plus declarative `script[type="webmcp-tool"]` blocks), pushes the report with snapshots, performs `WEBMCP_INVOKE` in the target frame, and reports the page's own tool outcome to `/agent/report`, which records it as `WEBMCP_RESULT` evidence before verifying (failed reports are recorded too, never silently dropped).
+
+Labels: `CdpModelContextTransport` and the probe JS are REAL code paths (UNVERIFIED against a live page: no `navigator.modelContext` existed in the build environment). `ExtensionSnapshotTransport` is REAL page-reported data (async; synchronous invoke honestly refuses with `BROWSER_NOT_READY`). `FakeModelContextTransport` is a TEST DOUBLE used by `tests/test_stage_e.py` (27 tests) — nothing about its output is presented as a live page. The fixture fallback and `/webmcp/execute` are PARTIAL.
+
 Honest limitations (not hidden):
 - No real Chrome/CDP session was available in the build environment: browser behavior was validated through a deterministic fake backend (67 tests in `tests/test_stage_d.py`) plus syntax and contract checks. The Playwright adapter's real-browser integration (launch, attach, crash hooks, frame walking) is implemented but UNVERIFIED against a live browser.
 - `dismiss_dialog` in the owned adapter returns the recorded dialog list; it does not dismiss a live dialog (Playwright auto-dismisses only when a handler is registered).
 - Frame ids for subframes are content-script-local (`sub:<hash>`); Chrome's numeric `frameId` is recorded when known but cross-frame targeting still relies on the chain.
-- WebMCP's `/webmcp/execute` still verifies through its own private `_verify_result()` path; unifying it with the gateway is Stage E work.
+- WebMCP's `/webmcp/execute` is the legacy Beta.1 fixture path, kept for compatibility and labeled PARTIAL; it can never verify a claim. The Stage E gateway (`/webmcp/discover`, `/webmcp/capabilities`, `/webmcp/invoke`) discovers page-advertised model-context tools per (session, tab, frame, document) and invokes them through the transaction engine with per-action verification.
+- Live-browser WebMCP was NOT verified: no page in the build environment exposes `navigator.modelContext`, so discovery/invocation ran against the explicit `FakeModelContextTransport` test double (27 tests in `tests/test_stage_e.py`). The CDP probe JS (`MODEL_CONTEXT_PROBE_JS` / `MODEL_CONTEXT_INVOKE_JS`), the content-script probe, and `OwnedBrowserRuntime.evaluate_js` are implemented but UNVERIFIED against a live page.
 - In extension mode the gateway's synchronous path reports UNVERIFIED until the closed loop's post-action observation arrives.
 - The mock planner and local model stubs remain deterministic heuristics for offline use; they are labeled as such in responses (`+mock-offline`).
 
@@ -169,6 +181,7 @@ Honest limitations (not hidden):
 - [x] ModelRouter (5 tiers)
 - [x] Benchmark harness (AES) + headless suite + co-working scenarios
 - [x] **WebMCP adapter registry (Level 0)**
+- [x] **Stage E: real WebMCP** — per-document discovery, page-advertised tools only, deterministic selection with full rationale, invocation through the transaction engine with `webmcp_result` verification, fail-closed missing tools, honest `webmcp_unavailable`, opt-in PARTIAL fixture fallback (never verifies), closed-loop extension path. 27 tests in `tests/test_stage_e.py`. Live-browser WebMCP UNVERIFIED (no `navigator.modelContext` in the build environment; exercised through the `FakeModelContextTransport` test double).
 - [x] **Capability Registry with risk/ownership/policy**
 - [x] **WebMCP policy-gated execution + verifier**
 - [x] **Truth Layer wired**: `/act`/`/transact` record Evidence + Claims, verify honestly

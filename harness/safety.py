@@ -19,6 +19,10 @@ ALLOWED_TOOLS = frozenset({
     "click", "type", "select", "scroll", "navigate", "back", "forward",
     "hover", "focus", "press_key", "upload", "snapshot", "bulk",
     "summarize", "ask_user",
+    # Stage E: WebMCP tool invocation through the page's model context.
+    # Risk/consent is enforced per-tool by the WebMCPGateway policy check;
+    # the safety layer still applies its destructive-pattern scan.
+    "webmcp_invoke",
 })
 
 # Destructive verbs that always require explicit consent, even if tool is allowed.
