@@ -7,8 +7,13 @@ instruction. This module provides deterministic, rule-based detection
 changing its mind):
 
 * ``classify_text`` scans page text for prompt-injection and
-  tool-impersonation patterns. It returns the matched markers; the
-  caller decides quarantine vs. flag.
+  tool-impersonation patterns. Before matching, the text is also
+  scanned through a unicode-normalized view (NFKC folding, invisible
+  characters stripped, Cyrillic/Greek homoglyphs folded to Latin), so
+  obfuscated variants of the same patterns are caught. Text carrying
+  zero-width/invisible characters is flagged even when no pattern
+  matches. It returns the matched markers; the caller decides
+  quarantine vs. flag.
 * ``sanitize_tool_advertisement`` validates a page-advertised WebMCP
   tool (name format, description free of injection, schema is a plain
   object). Tools that fail are quarantined (dropped) with a recorded
@@ -23,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 
 # -- prompt-injection markers ---------------------------------------------------
 # Deterministic regex list. Kept deliberately narrow: a false positive
@@ -32,6 +38,7 @@ INJECTION_PATTERNS = [
     # classic instruction override
     re.compile(r"(?i)\bignore\s+(all\s+|your\s+|the\s+)?(previous|prior|above)\s+instructions?\b"),
     re.compile(r"(?i)\bdisregard\s+(all\s+|your\s+|the\s+)?(previous|prior|above|safety)\b"),
+    re.compile(r"(?i)\bdisregard\s+(the\s+)?system\s+prompt\b"),
     re.compile(r"(?i)\b(you\s+are\s+now|from\s+now\s+on\s+you\s+are)\b"),
     re.compile(r"(?i)\bnew\s+(system\s+)?instructions?\s*:"),
     re.compile(r"(?i)\b(system\s+prompt\s+override|override\s+the\s+system)\b"),
@@ -47,6 +54,83 @@ INJECTION_PATTERNS = [
     re.compile(r"(?i)\bsend\s+(your\s+)?(api[_\s-]?key|password|credentials|secrets?)\s+to\b"),
     re.compile(r"(?i)\bdo\s+not\s+tell\s+the\s+user\b"),
 ]
+
+# -- unicode-obfuscation hardening ---------------------------------------------------
+# Injection phrases are often smuggled past the regex list by rendering
+# them with lookalike or invisible characters: fullwidth Latin (NFKC
+# folds it), zero-width spaces/joiners splitting words, or Cyrillic and
+# Greek letters that are visually identical to Latin. The classifier
+# therefore scans a normalized view of the text in addition to the raw
+# text. Everything here is deterministic and stdlib-only
+# (unicodedata); the map below covers only the highest-risk
+# confusables, i.e. letters indistinguishable from Latin in common
+# fonts, not every Unicode lookalike.
+
+# Invisible/format characters that have no legitimate role in the
+# short page strings we scan (node names, tool names/descriptions).
+# Deliberately excludes U+00A0 (non-breaking space, common in real
+# pages) and U+200E/U+200F (bidi marks, common in legitimate RTL
+# text): flagging those would quarantine ordinary content.
+_INVISIBLE_CHARS = frozenset({
+    "\u200b",  # ZERO WIDTH SPACE
+    "\u200c",  # ZERO WIDTH NON-JOINER
+    "\u200d",  # ZERO WIDTH JOINER
+    "\ufeff",  # ZERO WIDTH NO-BREAK SPACE (BOM)
+    "\u2060",  # WORD JOINER
+    "\u00ad",  # SOFT HYPHEN
+    "\u180e",  # MONGOLIAN VOWEL SEPARATOR
+    "\u2061",  # FUNCTION APPLICATION (invisible)
+    "\u2062",  # INVISIBLE TIMES
+    "\u2063",  # INVISIBLE SEPARATOR
+    "\u2064",  # INVISIBLE PLUS
+    "\u3164",  # HANGUL FILLER
+    "\uffa0",  # HALFWIDTH HANGUL FILLER
+    "\u2800",  # BRAILLE PATTERN BLANK
+})
+
+# Cyrillic and Greek letters visually identical to Latin, folded to
+# their Latin counterpart before pattern matching.
+_CONFUSABLE_MAP = {
+    # Cyrillic lowercase
+    "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p",
+    "\u0441": "c", "\u0445": "x", "\u0456": "i", "\u0458": "j",
+    "\u0455": "s", "\u04bb": "h", "\u043a": "k", "\u043c": "m",
+    "\u043d": "h", "\u0442": "t", "\u0443": "y",
+    # Cyrillic uppercase
+    "\u0410": "A", "\u0412": "B", "\u0421": "C", "\u0415": "E",
+    "\u041d": "H", "\u0406": "I", "\u0408": "J", "\u041a": "K",
+    "\u041c": "M", "\u041e": "O", "\u0420": "P", "\u0405": "S",
+    "\u0422": "T", "\u0425": "X", "\u04ae": "Y",
+    # Greek lowercase
+    "\u03b1": "a", "\u03b5": "e", "\u03b9": "i", "\u03ba": "k",
+    "\u03bd": "v", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t",
+    "\u03c5": "u", "\u03c7": "x", "\u03b6": "z", "\u03b7": "n",
+    # Greek uppercase
+    "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u0396": "Z",
+    "\u0397": "H", "\u0399": "I", "\u039a": "K", "\u039c": "M",
+    "\u039d": "N", "\u039f": "O", "\u03a1": "P", "\u03a4": "T",
+    "\u03a5": "Y", "\u03a7": "X",
+}
+
+
+def find_invisible_chars(text: str) -> list[str]:
+    """Sorted list of invisible/format codepoints present in the text."""
+    return sorted({ch for ch in (text or "") if ch in _INVISIBLE_CHARS})
+
+
+def normalize_for_scan(text: str) -> str:
+    """Normalized view of page text for injection scanning.
+
+    NFKC-normalization folds compatibility forms (fullwidth Latin,
+    ligatures, roman numerals) to their canonical shape; invisible
+    characters are stripped (so a zero-width joiner splitting a word
+    cannot break a pattern); then Cyrillic/Greek homoglyphs are folded
+    to Latin. Deterministic, stdlib-only.
+    """
+    t = unicodedata.normalize("NFKC", text or "")
+    t = "".join(ch for ch in t if ch not in _INVISIBLE_CHARS)
+    return "".join(_CONFUSABLE_MAP.get(ch, ch) for ch in t)
+
 
 # Tool names must look like identifiers; anything else is either a page
 # bug or an impersonation attempt.
@@ -104,6 +188,14 @@ def classify_text(text: str) -> dict:
 
     Returns {"injection": bool, "markers": [pattern strings that hit]}.
     Never raises; empty/None text is clean.
+
+    The raw text is scanned first; then a normalized view (NFKC,
+    invisible characters stripped, Cyrillic/Greek homoglyphs folded to
+    Latin) is scanned so obfuscated variants of the same patterns are
+    caught. Markers from the normalized view are prefixed
+    "[obfuscated]". Text carrying zero-width/invisible characters is
+    flagged even when no pattern matches: such characters have no
+    legitimate role in the short page strings scanned here.
     """
     markers = []
     t = text or ""
@@ -115,6 +207,18 @@ def classify_text(text: str) -> dict:
             markers.append(m.group(0)[:80])
             if len(markers) >= 5:
                 break
+    folded = normalize_for_scan(t)
+    if folded != t and len(markers) < 5:
+        for pat in INJECTION_PATTERNS:
+            m = pat.search(folded)
+            if m:
+                markers.append("[obfuscated] " + m.group(0)[:80])
+                if len(markers) >= 5:
+                    break
+    invis = find_invisible_chars(t)
+    if invis and len(markers) < 5:
+        markers.append("[invisible chars: %s]"
+                       % " ".join("U+%04X" % ord(c) for c in invis))
     return {"injection": bool(markers), "markers": markers}
 
 

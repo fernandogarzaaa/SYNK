@@ -59,7 +59,7 @@ Every subsystem carries one honest label:
 | Fail-closed element refs | REAL | tab/frame/origin/version/fingerprint/frame-chain/shadow-path checks |
 | Independent verifier | REAL | Evidence-strength hierarchy; command-accepted evidence can never verify |
 | Policy framework (`harness/policy.py`) | REAL | Per-origin default-deny allowlists, escalation review, consent gates |
-| Contamination guards (`harness/contamination.py`) | REAL | Injection quarantine, secret redaction, schema validation; unicode-obfuscation limits documented |
+| Contamination guards (`harness/contamination.py`) | REAL | Injection quarantine with unicode-obfuscation hardening (NFKC folding, invisible-char detection, Cyrillic/Greek confusable map), secret redaction, schema validation |
 | Task scheduler (`harness/task_scheduler.py`) | REAL | Sequential, lease-aware, dependency-ordered; dispatch correctness benchmarked |
 | Workflow learning | REAL | Miner + memory, replay/suggest endpoints |
 | Model router / compiler | REAL | Requirement-based routing, task-spec compiler with typed errors |
