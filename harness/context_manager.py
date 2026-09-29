@@ -2,9 +2,13 @@
 
 Stage B: element references are now structured ElementRefs carrying
 session/tab/frame identity, snapshot version, origin, locator, and an
-element fingerprint. The resolver FAILS CLOSED on stale versions, tab /
-frame / origin / document changes, fingerprint mismatches, and ambiguous
-or missing locator matches. Python hash() is never used for identity.
+element fingerprint. Stage D: refs additionally encode a frame_chain
+(ordered frame ids from the tab root) and a shadow_path (ordered
+shadow-host selectors), so targets inside iframes and shadow trees
+resolve precisely. The resolver FAILS CLOSED on stale versions, tab /
+frame / origin / document changes, frame-chain or shadow-path drift,
+fingerprint mismatches, and ambiguous or missing locator matches.
+Python hash() is never used for identity.
 """
 from __future__ import annotations
 
@@ -144,11 +148,19 @@ class ContextManager:
             ref = self._ref_counter
             n["ref"] = ref
             fp = fingerprint_of(n, frame_id)
+            # Stage D: refs can address into nested frames and shadow trees.
+            # frame_chain is ordered from the tab root (["main"] for the top
+            # document); shadow_path is the ordered list of shadow-host
+            # selectors from the frame document to the target's shadow tree.
+            frame_chain = n.get("frame_chain") or [n.get("frame_id", frame_id)]
+            shadow_path = n.get("shadow_path") or []
             eref = {
                 "ref_id": ref,
                 "session_id": session_id,
                 "tab_id": tab_id,
                 "frame_id": n.get("frame_id", frame_id),
+                "frame_chain": list(frame_chain),
+                "shadow_path": list(shadow_path),
                 "snapshot_version": tab_version,
                 "origin": origin,
                 "url": url,
@@ -230,13 +242,17 @@ class ContextManager:
                     tab_id: str | None = None,
                     frame_id: str | None = None,
                     origin: str | None = None,
-                    fingerprint: dict | None = None) -> dict | None:
+                    fingerprint: dict | None = None,
+                    frame_chain: list | None = None,
+                    shadow_path: list | None = None) -> dict | None:
         """Resolve an ElementRef, failing closed on any identity drift.
 
         Rejects when: ref unknown; page_version missing or != the ref's
         snapshot version; the ref's snapshot is not the tab's CURRENT
         snapshot (an old ref never resolves just because the caller passes
-        the latest version); tab/frame/origin mismatch; fingerprint mismatch.
+        the latest version); tab/frame/origin mismatch; frame_chain or
+        shadow_path mismatch (the target moved to a different frame or
+        shadow tree); fingerprint mismatch.
         """
         meta = self.refs.get(ref)
         if not meta:
@@ -254,6 +270,14 @@ class ContextManager:
             return None
         if origin is not None and origin != meta["origin"]:
             return None
+        # Stage D: frame-chain / shadow-path addressing must match exactly;
+        # a ref that moved frames or shadow trees is a different element.
+        if frame_chain is not None and list(frame_chain) != list(
+                meta.get("frame_chain", [meta.get("frame_id", MAIN_FRAME)])):
+            return None
+        if shadow_path is not None and list(shadow_path) != list(
+                meta.get("shadow_path", [])):
+            return None
         if fingerprint is not None:
             for f in FINGERPRINT_FIELDS:
                 if f in fingerprint and fingerprint[f] != meta["fingerprint"].get(f):
@@ -265,17 +289,33 @@ class ContextManager:
 
     # -- prompt ---------------------------------------------------------------
     def build_prompt(self, goal: str, memory_summary: str = "") -> str:
-        if not self.current:
+        return self._render_prompt(goal, self.current, memory_summary)
+
+    def prompt_for_tab(self, goal: str, tab_id: str,
+                       memory_summary: str = "") -> str:
+        """Render the prompt from a specific tab's latest snapshot.
+
+        The closed-loop agent plans against its pinned tab, not whatever
+        tab happened to be ingested first. Falls back to the current
+        snapshot when the tab has none (e.g. a tab that only ever sent
+        events, never a snapshot).
+        """
+        snap = self._tab_snapshots.get(tab_id) or self.current
+        return self._render_prompt(goal, snap, memory_summary)
+
+    def _render_prompt(self, goal: str, snap: dict | None,
+                       memory_summary: str) -> str:
+        if not snap:
             return f"Goal: {goal}\n(no page loaded)"
         lines = [f"Goal: {goal}",
-                 f"Page: {self.current['url']} (tab={self.current.get('tab_id','default')} "
-                 f"v{self.current['version']}, origin={self.current.get('origin','?')})"]
+                 f"Page: {snap['url']} (tab={snap.get('tab_id','default')} "
+                 f"v{snap['version']}, origin={snap.get('origin','?')})"]
         if memory_summary:
             lines.append(f"Memory: {memory_summary}")
-        if self.current.get("diff"):
-            lines.append(f"Change since last step: {self.current['diff']}")
+        if snap.get("diff"):
+            lines.append(f"Change since last step: {snap['diff']}")
         lines.append("Elements [ref] role 'name' (refs valid for this snapshot version only):")
-        for n in self.current["nodes"][:self.max_nodes]:
+        for n in snap["nodes"][:self.max_nodes]:
             state = []
             if n.get("disabled"):
                 state.append("disabled")

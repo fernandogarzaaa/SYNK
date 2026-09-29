@@ -384,12 +384,19 @@ class AgentLoop:
     def report(self, ctx: TaskExecutionContext, action_id: str | None,
                claim_id: str | None, status: str,
                error_code: str | None = None,
-               reason: str | None = None) -> dict:
+               reason: str | None = None,
+               browser_ack: dict | None = None) -> dict:
         """OBSERVE (already ingested by the caller) -> VERIFY -> DECIDE.
 
         status: "executed" (browser ran the command; re-verify the claim
         against the fresh observation), "not_executed" (dispatch never
         happened), "browser_failed".
+
+        browser_ack: the executor's BROWSER_ACK dict (Stage D). It is
+        validated (fail closed on dishonest acks) and recorded as
+        BROWSER_ACK evidence -- audit trail only; it can NEVER satisfy a
+        postcondition. Only independent observation can move the claim to
+        VERIFIED.
         """
         from .verification.results import (VERIFIED, FAILED, UNVERIFIED,
                                            CONFLICTING)
@@ -451,9 +458,22 @@ class AgentLoop:
             return {"decision": "replan",
                     "reason": f"browser execution failed: {reason}"}
 
-        # status == "executed": the browser ran the command. Record the
-        # fresh canonical-state observation as evidence, then re-verify the
-        # claim. Only independent observation can move it to VERIFIED.
+        # status == "executed": the browser ran the command. Validate the
+        # browser ack (fail closed on a self-attested "executed" without an
+        # observation), record it as BROWSER_ACK evidence (audit trail
+        # only), then record the fresh canonical-state observation as
+        # evidence and re-verify the claim. Only independent observation
+        # can move it to VERIFIED.
+        ack_note = None
+        if browser_ack is not None:
+            ack_note = self._validate_and_record_ack(ctx, action_id,
+                                                     claim_id, browser_ack)
+            if ack_note is not None:
+                # Dishonest or mismatched ack: treat as a failed execution.
+                ctx.consecutive_failures += 1
+                ctx.note("browser_failed", ack_note)
+                return {"decision": "replan",
+                        "reason": f"browser execution failed: {ack_note}"}
         if claim_id:
             self._record_state_observation(ctx, claim_id, action_id)
             result = self.state.verifier.verify(claim_id)
@@ -504,7 +524,7 @@ class AgentLoop:
             mem_summary = state.mem.summary_for_prompt()
         except Exception:
             mem_summary = ""
-        prompt = state.ctx.build_prompt(ctx.goal, mem_summary)
+        prompt = state.ctx.prompt_for_tab(ctx.goal, ctx.tab_id, mem_summary)
         try:
             prompt += "\n" + state.world.prompt_section()
         except Exception:
@@ -564,6 +584,67 @@ class AgentLoop:
                     "reason": f"repeated contention ({code}); "
                               f"human takeover suggested"}
         return {"decision": "replan", "reason": f"{code}: {reason}"}
+
+    def _validate_and_record_ack(self, ctx: TaskExecutionContext,
+                                   action_id: str | None,
+                                   claim_id: str | None,
+                                   ack: dict) -> str | None:
+        """Validate a BROWSER_ACK and record it as evidence.
+
+        Returns None when the ack is accepted, or a failure reason when the
+        ack is dishonest / mismatched (caller then treats the execution as
+        failed). Rules, fail closed:
+
+        - ack must be a dict with ack=True
+        - if ack carries an action_id it must match this action_id
+        - ack.executed=True REQUIRES a non-empty ack.observed; a bare
+          "executed" claim with no observation is rejected outright
+        - ack.observed must carry the same frame/tab identity it targeted
+          (frame mismatch => the wrong frame replied)
+
+        The recorded BROWSER_ACK evidence is audit-trail only: per the
+        evidence strength hierarchy it can never satisfy a postcondition.
+        """
+        if not isinstance(ack, dict) or ack.get("ack") is not True:
+            return "malformed browser ack"
+        ack_aid = ack.get("action_id")
+        if ack_aid and action_id and ack_aid != action_id:
+            return (f"ack action_id mismatch: {ack_aid} != {action_id}")
+        observed = ack.get("observed")
+        if ack.get("executed") is True:
+            if not isinstance(observed, dict) or not observed:
+                return "dishonest ack: executed=True with no observation"
+            ts = observed.get("target_state")
+            if not isinstance(ts, dict) or not ts:
+                return "dishonest ack: executed=True with empty target state"
+        from .verification.evidence import BROWSER_ACK, Evidence, strength_of
+        from .session import new_id as _new_id
+        import time as _time
+        import uuid as _uuid
+        self.state.verifier.record_evidence(Evidence(
+            evidence_id=f"e_{_uuid.uuid4().hex[:8]}",
+            evidence_type=BROWSER_ACK,
+            source="runtime", timestamp=_time.time(),
+            action_id=action_id, task_id=ctx.task_id,
+            strength=strength_of(BROWSER_ACK),
+            payload={"command": ack.get("command"),
+                     "accepted": ack.get("accepted"),
+                     "executed": ack.get("executed"),
+                     "error": ack.get("error"),
+                     "error_code": ack.get("error_code"),
+                     "tab_id": ack.get("tab_id"),
+                     "window_id": ack.get("window_id"),
+                     "frame_id": ack.get("frame_id"),
+                     "observed": observed,
+                     "provenance_note": "executor self-attestation: "
+                                        "recorded for audit, never "
+                                        "verifies a postcondition"},
+            provenance="executor_ack"))
+        ctx.note("browser_ack",
+                 f"{action_id}: accepted={ack.get('accepted')} "
+                 f"executed={ack.get('executed')} "
+                 f"error={ack.get('error_code') or ack.get('error')}")
+        return None
 
     def _record_state_observation(self, ctx: TaskExecutionContext,
                                   claim_id: str,

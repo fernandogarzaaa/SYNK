@@ -25,10 +25,14 @@ User <-> extension/sidebar <---> harness/server (127.0.0.1:18080) <---> LLM
 ## Quickstart
 
 ```powershell
-# 1. start harness (extension mode; no browser dependency)
+# 1. start harness (attached-extension mode; no browser dependency)
 python -m harness.server --port 18080 --db agent_memory.db
-#    CDP mode (requires: pip install playwright; playwright install chromium):
+#    Managed-launch mode: SYNK-owned Chromium, persistent SYNK profile
+#    (requires: pip install playwright; playwright install chromium).
+#    NEVER the user's browser.
 #    python -m harness.server --port 18080 --use-cdp
+#    Explicit CDP attach (operator-named endpoint only):
+#    python -m harness.server --port 18080 --cdp-endpoint ws://127.0.0.1:9222/devtools/browser/<id>
 #    Real local SLM (see docs/local-models.md):
 #    $env:SYNK_LOCAL_MODEL='endpoint'
 #    $env:SYNK_LOCAL_MODEL_URL='http://127.0.0.1:8090/v1/chat/completions'
@@ -121,9 +125,20 @@ planner — the prototype works fully offline.
 17. **Closed-loop agent** — `/agent/*` endpoints plus the extension's rewritten `runTask()`: observe → update world → select capability → plan → validate → lease → execute one mutation → observe → verify → decide (success | continue | replan | request-human | abort). Step budgets are task-scoped (`TaskExecutionContext`); tasks never share one budget. Refs are pinned to a snapshot version and fail closed on drift; leases release exactly once in `/agent/report`.
 18. **`page.loaded` dedup** — snapshots are journaled exactly once via the single bus-event ingest path.
 
+### Stage D (✓): real browser layer
+19. **Browser adapter contract** (`harness/browser_runtime.py`) — REAL: one `BrowserRuntime` interface (lifecycle, targeting, observation, interaction, inspection, events) with typed errors, per-tab health states, and a `BrowserAck` that makes `executed=True` inseparable from the post-state observation.
+20. **Three honest browser modes** — attached-extension (default; the user's own browser, driven only via extension snapshots + the `/agent/*` closed loop, SYNK never launches or debugs anything), owned-launch (`--use-cdp`; SYNK-managed Chromium with a persistent SYNK-owned profile, explicitly NOT the user's browser), attached-endpoint (`--cdp-endpoint`; connects only to the operator-named CDP endpoint). The old "attach to the user's browser via --remote-debugging-port" implication is gone.
+21. **Robust interaction primitives** — `harness/interactions.py` (mirrored in `extension/content.js`): native value setter for controlled React/Vue/Svelte inputs, contenteditable, checkbox/radio, select, keyboard sequences, shadow-DOM traversal, frame targeting with fail-closed mismatch, and post-state observation before replying.
+22. **Ref-safe dispatch** — opaque integer refs are resolved through `RefResolver` before reaching any adapter; the old `page.click("3")` bug is gone. Refs carry frame chains and shadow paths and fail closed on drift.
+23. **Browser acknowledgements** — the extension's `EXECUTE` handler performs the robust primitive and replies with a `BROWSER_ACK` carrying the observed post-state; the background loop only reports `executed` when the ack says so, and forwards it to `/agent/report`. The server validates the ack (fail closed on `executed=True` without an observation, or on action-id mismatch) and records it as `BROWSER_ACK` evidence: audit trail only, it can NEVER verify a postcondition. Lifecycle: DISPATCHED → BROWSER_ACK → OBSERVED → VERIFIED.
+24. **Frame/document identity** — frames carry parent, frame chain, and the browser's own frame id; document identity is preserved across snapshot events and replaced on navigation (so stale refs fail closed).
+
 Honest limitations (not hidden):
+- No real Chrome/CDP session was available in the build environment: browser behavior was validated through a deterministic fake backend (67 tests in `tests/test_stage_d.py`) plus syntax and contract checks. The Playwright adapter's real-browser integration (launch, attach, crash hooks, frame walking) is implemented but UNVERIFIED against a live browser.
+- `dismiss_dialog` in the owned adapter returns the recorded dialog list; it does not dismiss a live dialog (Playwright auto-dismisses only when a handler is registered).
+- Frame ids for subframes are content-script-local (`sub:<hash>`); Chrome's numeric `frameId` is recorded when known but cross-frame targeting still relies on the chain.
 - WebMCP's `/webmcp/execute` still verifies through its own private `_verify_result()` path; unifying it with the gateway is Stage E work.
-- In extension mode the gateway's synchronous path reports UNVERIFIED until the closed loop's post-action observation arrives; the extension `EXECUTE` content-script handler must report the browser's actual result (ok / error) for verification to mean anything.
+- In extension mode the gateway's synchronous path reports UNVERIFIED until the closed loop's post-action observation arrives.
 - The mock planner and local model stubs remain deterministic heuristics for offline use; they are labeled as such in responses (`+mock-offline`).
 
 ## Safety (Alpha + Beta + Beta.1 §21)

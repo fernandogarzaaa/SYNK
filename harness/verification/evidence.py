@@ -24,19 +24,30 @@ APPLICATION_CONFIRMATION = "APPLICATION_CONFIRMATION"
 BROWSER_EVENT = "BROWSER_EVENT"
 HUMAN_EVENT = "HUMAN_EVENT"
 AGENT_EVENT = "AGENT_EVENT"
+# Stage D: the executor's own acknowledgement of a DOM operation --
+# "I ran the primitive and this is the post-state I observed". It is
+# SELF-ATTESTED (not an independent observation), so it ranks above mere
+# dispatch acceptance but can NEVER satisfy a postcondition on its own.
+BROWSER_ACK = "BROWSER_ACK"
 
 # Evidence strength hierarchy (Stage C / mandate Phase 12).
 #
 # A claim is VERIFIED only from evidence *appropriate to its declared
 # postcondition*. Strength is provenance-weighted: "the executor accepted
 # the command" (BROWSER_EVENT / COMMAND_ACCEPTED tier) is the weakest
-# tier and can NEVER satisfy a postcondition on its own. A bare screenshot
-# is likewise insufficient unless a dedicated vision verifier explicitly
-# established the postcondition (payload["vision_verified"] is True).
+# tier and can NEVER satisfy a postcondition on its own. A BROWSER_ACK is
+# the executor's self-attested "I ran it" -- recorded for the audit trail
+# but likewise incapable of satisfying a postcondition: only an
+# INDEPENDENT observation (DOM_CHANGE / ELEMENT_STATE / ...) can. A bare
+# screenshot is likewise insufficient unless a dedicated vision verifier
+# explicitly established the postcondition (payload["vision_verified"] is
+# True).
 EVIDENCE_STRENGTH = {
     BROWSER_EVENT: 0.10,            # COMMAND_ACCEPTED: dispatch only
     AGENT_EVENT: 0.15,              # agent-internal note
     SCREENSHOT: 0.20,               # visual; needs vision verifier
+    BROWSER_ACK: 0.25,              # executor self-attestation (Stage D);
+                                   # audit trail only, never verifies
     DOM_CHANGE: 0.45,               # DOM_OBSERVATION
     ELEMENT_STATE: 0.50,            # canonical state read
     ACCESSIBILITY_CHANGE: 0.55,     # ACCESSIBILITY_OBSERVATION
@@ -53,8 +64,8 @@ EVIDENCE_STRENGTH = {
 }
 
 # Postcondition kind -> evidence types that may satisfy it. Types absent
-# here (BROWSER_EVENT, AGENT_EVENT, bare SCREENSHOT) can never verify a
-# postcondition, no matter how many are recorded.
+# here (BROWSER_EVENT, AGENT_EVENT, BROWSER_ACK, bare SCREENSHOT) can
+# never verify a postcondition, no matter how many are recorded.
 POSTCONDITION_EVIDENCE = {
     "element_value": {DOM_CHANGE, ACCESSIBILITY_CHANGE, ELEMENT_STATE,
                       HUMAN_EVENT, APPLICATION_CONFIRMATION},

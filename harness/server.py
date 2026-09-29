@@ -22,7 +22,7 @@ from .concurrency import (CONFLICT, HUMAN_OWNED, LeaseManager,
                               OwnershipGraph, TransactionRunner)
 from .context_manager import ContextManager
 from .event_bus import EventBus
-from .session import SessionManager, new_id
+from .session import SessionManager, new_id, MAIN_FRAME
 from .ladder import ExecutionLadder, LADDER
 from .memory import MemoryStore
 from .orchestrator import Orchestrator
@@ -91,18 +91,35 @@ def _claimed_state_for_action(action: dict):
 
 
 class State:
-    def __init__(self, db_path: str, use_cdp: bool = False):
+    def __init__(self, db_path: str, use_cdp: bool = False,
+                 cdp_endpoint: str = "", profile_dir: str = ""):
         self.safety = SafetyLayer(SafetyConfig())
         self.ctx = ContextManager()
         self.mem = MemoryStore(db_path)
-        # Phase 2: CDP Browser Controller (must exist before ToolExecutor).
-        # Default off: extension push mode. Enable with use_cdp=True.
+        # Stage D browser modes (exactly one):
+        #   default            attached-extension: the user's own browser,
+        #                      driven only via extension snapshots + the
+        #                      /agent/* closed loop. SYNK never launches or
+        #                      debugs anything here.
+        #   --use-cdp          managed launch: SYNK-owned Chromium with a
+        #                      persistent SYNK profile. NOT the user's browser.
+        #   --cdp-endpoint URL explicit attach: connect to the CDP endpoint
+        #                      YOU named. Never inferred, never the default.
+        if use_cdp and cdp_endpoint:
+            raise ValueError("--use-cdp and --cdp-endpoint are mutually "
+                             "exclusive")
         self.use_cdp = use_cdp
-        self.browser = BrowserController(headless=False)
+        self.cdp_endpoint = cdp_endpoint
+        self.browser = BrowserController(
+            headless=False, profile_dir=profile_dir or None)
+        # Stage D: the connected BrowserRuntime (managed-launch or explicit
+        # attach; set once the browser thread finishes connect()).
+        self.browser_runtime = None
         self.loop = asyncio.new_event_loop()
         self.browser_thread = None
-        if self.use_cdp:
-            self.browser_thread = threading.Thread(target=self._run_event_loop, daemon=True)
+        if self.use_cdp or self.cdp_endpoint:
+            self.browser_thread = threading.Thread(
+                target=self._run_event_loop, daemon=True)
             self.browser_thread.start()
         self.tools = ToolExecutor(self.safety, browser=self.browser)
         self.llm = Orchestrator()
@@ -151,6 +168,24 @@ class State:
     def _run_event_loop(self):
         asyncio.set_event_loop(self.loop)
         self.loop.run_until_complete(self.browser.start())
+        # Expose the connected BrowserRuntime so ToolExecutor dispatches
+        # through the real adapter interface (ref-safe, honest acks).
+        # Explicit-attach mode connects the endpoint the operator named;
+        # it is never inferred and never the user's browser by default.
+        try:
+            if self.cdp_endpoint:
+                from .browser_owned import OwnedBrowserRuntime
+                rt = OwnedBrowserRuntime.attach(self.cdp_endpoint)
+                rt.connect()
+                self.browser_runtime = rt
+                print(f"Browser attached: explicit CDP endpoint "
+                      f"{self.cdp_endpoint}")
+            else:
+                rt = self.browser.runtime
+                self.browser_runtime = rt if rt.connected else None
+        except Exception as e:
+            print(f"Browser connect failed: {e}")
+            self.browser_runtime = None
         self.loop.run_forever()
 
     # -- bus fan-out -----------------------------------------------------------
@@ -161,6 +196,17 @@ class State:
                  "focus.changed", "human.action", "agent.action", "agent.lease",
                  "agent.goal", "dialog.opened", "dialog.closed"):
             self.world.apply_event({"type": t, "data": d})
+            # Stage D: a navigation replaces the tab's document identity so
+            # refs pinned against the old document fail closed afterwards.
+            if t == "page.navigated" and d.get("url"):
+                try:
+                    self.sessions.navigate(
+                        d.get("tab_id", "default"), d["url"],
+                        d.get("title", ""),
+                        window_id=d.get("window_id", "win_default"),
+                        session_id=d.get("session_id"))
+                except Exception:
+                    pass
         # Truth Layer: runtime observations become immutable Evidence.
         try:
             task_id = d.get("task_id")
@@ -329,7 +375,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "dependencies": sorted(task.dependencies)})
         if path == "/task/run":
             def _plan_task(task):
-                prompt = STATE.ctx.build_prompt(task.intent, STATE.mem.summary_for_prompt())
+                prompt = STATE.ctx.prompt_for_tab(task.intent, task.tab_id,
+                                                  STATE.mem.summary_for_prompt())
                 prompt += "\n" + STATE.world.prompt_section()
                 plan = STATE.llm.plan(task.intent, STATE.safety.mask_pii(prompt),
                                       STATE.mem.summary_for_prompt())
@@ -429,12 +476,26 @@ class Handler(BaseHTTPRequestHandler):
             url = b.get("url", "")
             nodes = b.get("nodes", [])
         # Canonical session registration: every snapshot carries explicit
-        # (session, window, tab, frame) identity.
+        # (session, window, tab, frame) identity, including the frame-tree
+        # position and Chrome's own frame id when the client knows it.
         sess = STATE.sessions.get_or_create_session(session_id)
+        # Stage D: a URL change on the main frame is a navigation -> the
+        # document identity is replaced BEFORE the new snapshot is
+        # registered, so stale refs fail closed.
+        prev_url = STATE.sessions.tab_url(tab_id,
+                                          session_id=sess.session_id)
+        if frame_id == MAIN_FRAME and url and prev_url and url != prev_url:
+            STATE.sessions.navigate(tab_id, url, title, window_id=window_id,
+                                    session_id=sess.session_id)
         STATE.sessions.register_tab(tab_id, window_id, sess.session_id,
                                     url=url, title=title)
         STATE.sessions.register_frame(tab_id, frame_id, window_id,
-                                      sess.session_id, url=url)
+                                      sess.session_id, url=url,
+                                      parent_frame_id=b.get("parent_frame_id"),
+                                      frame_chain=b.get("frame_chain"),
+                                      name=b.get("frame_name", ""),
+                                      chromium_frame_id=b.get(
+                                          "chromium_frame_id"))
         for i, n in enumerate(nodes):
             n.setdefault("index", i)
             n.setdefault("frame_id", frame_id)
@@ -468,7 +529,8 @@ class Handler(BaseHTTPRequestHandler):
         view["window_id"] = window_id
         view["frame_id"] = frame_id
         view["observation_id"] = obs["observation_id"]
-        view["prompt"] = STATE.ctx.build_prompt(b.get("goal", ""), STATE.mem.summary_for_prompt())
+        view["prompt"] = STATE.ctx.prompt_for_tab(b.get("goal", ""), tab_id,
+                                                  STATE.mem.summary_for_prompt())
         view["prompt"] = STATE.safety.mask_pii(view["prompt"])
         if injected:
             view["warning"] = ("Page contains possible prompt-injection text; "
@@ -521,7 +583,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, plan)
 
         # Fallback to Cloud LLM
-        prompt = STATE.ctx.build_prompt(goal, STATE.mem.summary_for_prompt())
+        prompt = STATE.ctx.prompt_for_tab(goal, STATE.world.active_tab,
+                                          STATE.mem.summary_for_prompt())
         prompt += "\n" + STATE.world.prompt_section()
         plan = STATE.llm.plan(goal, STATE.safety.mask_pii(prompt),
                                STATE.mem.summary_for_prompt())
@@ -677,6 +740,8 @@ class Handler(BaseHTTPRequestHandler):
         The client MUST push the post-action observation via /snapshot
         before calling this with status="executed"; the loop records that
         fresh canonical-state read as evidence and re-verifies the claim.
+        The client's browser_ack (Stage D) is validated and recorded as
+        BROWSER_ACK evidence (audit trail only) before verification.
         """
         ctx = STATE.agent.get(b.get("task_id", ""))
         if ctx is None:
@@ -684,7 +749,8 @@ class Handler(BaseHTTPRequestHandler):
         decision = STATE.agent.report(
             ctx, b.get("action_id"), b.get("claim_id"),
             b.get("status", "executed"),
-            error_code=b.get("error_code"), reason=b.get("reason"))
+            error_code=b.get("error_code"), reason=b.get("reason"),
+            browser_ack=b.get("browser_ack"))
         return self._send(200, {"ok": True, "task_id": ctx.task_id,
                                 "verified": ctx.verified,
                                 "replans": ctx.replans,
@@ -881,13 +947,27 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=18080)
     ap.add_argument("--db", default=":memory:")
     ap.add_argument("--use-cdp", action="store_true",
-                    help="Enable CDP browser control (requires playwright). Default: extension mode.")
+                    help="Managed launch: start a SYNK-owned Chromium with a "
+                         "persistent SYNK profile (requires playwright). "
+                         "NEVER attaches to the user's browser. "
+                         "Default: attached-extension mode.")
+    ap.add_argument("--cdp-endpoint", default="",
+                    help="Explicit CDP endpoint to attach to "
+                         "(ws://host:port/devtools/browser/<id>). Mutually "
+                         "exclusive with --use-cdp; attach mode only talks to "
+                         "the endpoint you name.")
+    ap.add_argument("--profile-dir", default="",
+                    help="Profile directory for managed launch (default: "
+                         "~/.synk/chromium-profile).")
     args = ap.parse_args()
     global STATE
-    STATE = State(args.db, use_cdp=args.use_cdp)
+    STATE = State(args.db, use_cdp=args.use_cdp,
+                  cdp_endpoint=args.cdp_endpoint,
+                  profile_dir=args.profile_dir)
     STATE._human_steps = []
     srv = HTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"ai-cowork harness on http://127.0.0.1:{args.port} (db={args.db} use_cdp={args.use_cdp})")
+    print(f"ai-cowork harness on http://127.0.0.1:{args.port} (db={args.db} "
+          f"use_cdp={args.use_cdp} cdp_endpoint={'set' if args.cdp_endpoint else ''})")
     srv.serve_forever()
 
 
