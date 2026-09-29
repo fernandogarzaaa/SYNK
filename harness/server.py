@@ -336,8 +336,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        # The unpacked extension's content script pushes snapshots from
+        # arbitrary web origins to this loopback harness. Without CORS
+        # headers the browser blocks the push (found by live-browser
+        # verification; the fake backend never performs a real fetch).
+        # The harness binds 127.0.0.1 and is unauthenticated by design;
+        # these headers match that local-operator threat model.
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:
+        # CORS preflight for the extension's cross-origin JSON pushes.
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods",
+                         "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _body(self) -> dict:
         try:

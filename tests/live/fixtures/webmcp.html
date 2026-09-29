@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebMCP stub shop</title>
+<script>
+  // Stub of the WebMCP proposal shape the gateway probes for:
+  // navigator.modelContext with async availableTools() and invokeTool().
+  // This is test scaffolding (a stand-in for a real WebMCP-enabled site),
+  // not a claim about any production page.
+  const tools = [
+    {
+      name: "getOrderStatus",
+      description: "Get the shipping status of an order",
+      input_schema: {
+        type: "object",
+        properties: { order_id: { type: "string" } },
+        required: ["order_id"],
+      },
+      annotations: { readOnlyHint: true },
+    },
+    {
+      name: "cancelOrder",
+      description: "Cancel an order",
+      input_schema: {
+        type: "object",
+        properties: { order_id: { type: "string" } },
+        required: ["order_id"],
+      },
+      annotations: { destructiveHint: true },
+    },
+  ];
+  const modelContext = {
+    availableTools: async () => tools.map((t) => ({ ...t })),
+    invokeTool: async (toolName, args) => {
+      args = args || {};
+      if (toolName === "getOrderStatus") {
+        if (!args.order_id) throw new Error("order_id is required");
+        return { order_id: args.order_id, status: "shipped" };
+      }
+      if (toolName === "cancelOrder") {
+        if (!args.order_id) throw new Error("order_id is required");
+        return { order_id: args.order_id, cancelled: true };
+      }
+      throw new Error("unknown tool: " + toolName);
+    },
+  };
+  try {
+    navigator.modelContext = modelContext;
+  } catch (e) {
+    Object.defineProperty(navigator, "modelContext",
+      { value: modelContext, configurable: true });
+  }
+</script>
+</head>
+<body>
+<h1>Stub shop (WebMCP advertised)</h1>
+<p>This page advertises two model-context tools: getOrderStatus, cancelOrder.</p>
+</body>
+</html>

@@ -64,9 +64,9 @@ Every subsystem carries one honest label:
 | Workflow learning | REAL | Miner + memory, replay/suggest endpoints |
 | Model router / compiler | REAL | Requirement-based routing, task-spec compiler with typed errors |
 | Closed-loop agent (`/agent/*`) | REAL | Observe > plan > validate > lease > execute > observe > verify > decide |
-| Extension (attached mode) | PARTIAL | Content script runs robust primitives and returns honest acks; real-Chrome end-to-end UNVERIFIED here |
-| Owned-browser adapter (Playwright/CDP) | PARTIAL | Implemented with honest mode separation; live-browser integration UNVERIFIED here |
-| WebMCP gateway | PARTIAL | Discovery, scoping, schema validation, policy; page model-context path needs a live page (UNVERIFIED here) |
+| Extension (attached mode) | REAL | Content script robust primitives and honest acks; unpacked-extension snapshot push and live `value.changed` event reporting verified in a real browser (`tests/live/`) |
+| Owned-browser adapter (Playwright/CDP) | REAL | Honest mode separation (owned launch, attached extension, explicit CDP endpoint); live launch, typing, navigation, snapshots verified in a real browser (`tests/live/`) |
+| WebMCP gateway | REAL | Discovery, scoping, schema validation, policy; page-advertised `navigator.modelContext` verified live, fail-closed absence and unadvertised-tool rejection covered (`tests/live/`) |
 | Memory store | REAL | Task-scoped, session-isolated, secrets redacted before storage |
 | Tauri shell (`shell/`) | EXPERIMENTAL | Thin HTTP client over the harness API; `cargo check` clean and full `cargo build` links on rustc 1.98.1; binary smoke-tested under Xvfb; installer packaging not validated here |
 | Benchmarks (`benchmark/`) | REAL | All numbers measured; methodology in `benchmark/REPORT.md` |
@@ -189,6 +189,34 @@ Base URL defaults to `http://127.0.0.1:18080`. All POST bodies are JSON.
 6. Execution failure (`FAILED`) is never reported as verification
    failure: if the tool call itself fails, no claim is proposed.
 
+## Live browser verification
+
+`tests/live/` exercises the real paths in a real Chromium (Playwright):
+
+- owned Chromium launch with a SYNK-owned profile, real typing /
+  clicking / navigation / snapshots through the transaction engine;
+- explicit attach to an operator-started `--remote-debugging-port`
+  endpoint, with endpoint discovery and fail-closed non-WebSocket
+  rejection;
+- live-page `navigator.modelContext` WebMCP discovery and invocation,
+  with fail-closed behavior when the page advertises nothing or the
+  tool is not advertised;
+- the sequential scheduler driving a real browser, completing only
+  when every action verifies against fresh snapshot evidence;
+- the unpacked extension: real snapshot push ingested by the harness
+  and live `value.changed` event reporting.
+
+Run them with a browser present:
+
+```bash
+python -m pytest tests/live/ -q
+```
+
+In CI (no browser, no playwright) every live test skips gracefully;
+set `SYNK_LIVE_BROWSER=0` to force the skip locally. Browser profiles
+go to `~/workspace/tmp/synk-live-profiles/` (the harness never touches
+the user's own browser data).
+
 ## Security model
 
 Summary; the full model is in `SECURITY.md`.
@@ -286,7 +314,8 @@ harness/            Python runtime (stdlib only; playwright optional)
 extension/          Chrome extension (attached mode)
 shell/              Tauri desktop shell (EXPERIMENTAL)
 benchmark/          Honest benchmarks + REPORT.md + results.json
-tests/              330 pytest / 325 unittest, incl. adversarial suite
+tests/              349 pytest / 344 unittest, incl. adversarial suite;
+                tests/live/ adds 19 live-browser tests (skip without a browser)
 demo/               Headless demo against the local harness
 docs/               Local-model setup and other operator docs
 SECURITY.md         Full security model
