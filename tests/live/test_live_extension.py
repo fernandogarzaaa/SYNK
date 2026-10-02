@@ -49,6 +49,25 @@ class TestLiveExtensionSnapshot(unittest.TestCase):
         # tmpfs in this environment, so point TMPDIR at workspace disk.
         os.environ["TMPDIR"] = str(Path.home() / "workspace" / "tmp")
         from harness.browser_owned import OwnedBrowserRuntime
+        cls.profile_dir = live_profile_dir(prefix="synk-live-ext-")
+        # Launch the real browser FIRST: when no working Chromium/display
+        # is available this raises, and we skip with a clear message
+        # instead of erroring after the harness servers are already up.
+        try:
+            cls.runtime = OwnedBrowserRuntime.launch(
+                profile_dir=cls.profile_dir, headless=False,
+                # Playwright disables extensions by default; the operator
+                # explicitly re-enables them to load this unpacked extension.
+                ignore_default_args=["--disable-extensions"],
+                extra_args=container_chrome_args() + [
+                    "--load-extension=" + EXT_DIR,
+                    "--disable-extensions-except=" + EXT_DIR,
+                    "--window-size=1280,900",
+                ])
+            cls.runtime.connect()
+        except Exception as e:
+            raise unittest.SkipTest(
+                f"live Chromium could not launch here: {e}") from e
         cls.server = FixtureServer()
         cls.base_url = cls.server.start()
         cls.checkout_url = cls.base_url + "/checkout.html"
@@ -56,18 +75,6 @@ class TestLiveExtensionSnapshot(unittest.TestCase):
         wait_until(
             lambda: _health_ok(), timeout=15,
             desc="harness server /health")
-        cls.profile_dir = live_profile_dir(prefix="synk-live-ext-")
-        cls.runtime = OwnedBrowserRuntime.launch(
-            profile_dir=cls.profile_dir, headless=False,
-            # Playwright disables extensions by default; the operator
-            # explicitly re-enables them to load this unpacked extension.
-            ignore_default_args=["--disable-extensions"],
-            extra_args=container_chrome_args() + [
-                "--load-extension=" + EXT_DIR,
-                "--disable-extensions-except=" + EXT_DIR,
-                "--window-size=1280,900",
-            ])
-        cls.runtime.connect()
         cls.tab = cls.runtime.new_tab(cls.checkout_url)
 
     @classmethod
