@@ -20,3 +20,8 @@ shell/src-tauri/WixTools/
 benchmark/results.json
 .eve-output/
 *.pyc
+
+# Local environment files (keep .env.example tracked)
+.env
+.env.*
+!.env.example
