@@ -6,7 +6,7 @@ authors = ["Fernando Garza <garza@inan.ai>"]
 edition = "2021"
 
 [build-dependencies]
-tauri-build = { version = "1.5", features = [] }
+tauri-build = { version = "2.7", features = [] }
 
 [features]
 default = ["custom-protocol"]
