@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/tauri';
+import { invoke } from '@tauri-apps/api/core';
 import { WorldStateView, ActionPanel, TruthLayerStatus } from './components/RuntimeUI';
 import { EventLog } from './components/EventLog';
 import { OwnershipMonitor } from './components/OwnershipMonitor';
