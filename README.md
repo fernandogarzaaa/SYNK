@@ -124,8 +124,8 @@ python -m harness.server --port 18080 --cdp-endpoint ws://127.0.0.1:9222/devtool
 Tests and benchmarks:
 
 ```bash
-python -m unittest discover -s tests        # 325 tests
-python -m pytest tests/ -q                  # 330 tests
+python -m unittest discover -s tests        # 348 tests
+python -m pytest tests/ -q                  # 353 tests
 python benchmark/runner.py                  # regenerates benchmark/results.json
 ```
 
@@ -314,7 +314,7 @@ harness/            Python runtime (stdlib only; playwright optional)
 extension/          Chrome extension (attached mode)
 shell/              Tauri desktop shell (EXPERIMENTAL)
 benchmark/          Honest benchmarks + REPORT.md + results.json
-tests/              349 pytest / 344 unittest, incl. adversarial suite;
+tests/              353 pytest / 348 unittest, incl. adversarial suite;
                 tests/live/ adds 19 live-browser tests (skip without a browser)
 demo/               Headless demo against the local harness
 docs/               Local-model setup and other operator docs
