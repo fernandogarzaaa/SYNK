@@ -371,8 +371,43 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quieter logs
         pass
 
+    @staticmethod
+    def _first_verification(verifications):
+        """First non-None verification entry, or None.
+
+        The gateway's "verifications" list is positional (one entry per
+        action) and an action that fails before verification runs leaves
+        None in its slot. Subscripting such an entry raised TypeError
+        inside the handler, which dropped the TCP connection with no HTTP
+        response at all (curl exit 52) -- the worst failure mode for a
+        runtime whose identity is "fail loud, never fake success".
+        """
+        return next((v for v in verifications if v), None)
+
+    def _fail_loud(self, dispatch):
+        """Run a request dispatch; never drop the connection on a bug.
+
+        Any unexpected exception becomes a typed 500 JSON response instead
+        of an empty reply. A dropped connection hides the failure from the
+        client; a 500 names it.
+        """
+        try:
+            return dispatch()
+        except BrokenPipeError:
+            return  # client went away; nothing left to send
+        except Exception as e:  # noqa: BLE001 - intentional last resort
+            try:
+                return self._send(500, {"ok": False,
+                                        "error": "internal error: %s" % (e,),
+                                        "error_type": type(e).__name__})
+            except Exception:
+                return
+
     # -- GET --------------------------------------------------------------------
     def do_GET(self):
+        return self._fail_loud(self._do_GET)
+
+    def _do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
             return self._send(200, {"ok": True, "service": "ai-cowork-harness",
@@ -421,6 +456,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- POST -------------------------------------------------------------------
     def do_POST(self):
+        return self._fail_loud(self._do_POST)
+
+    def _do_POST(self):
         path = urlparse(self.path).path
         b = self._body()
         if path == "/snapshot":
@@ -879,6 +917,17 @@ class Handler(BaseHTTPRequestHandler):
             action = _normalize_local_decision(decision, goal)
         if action is not None:
             plan = {"actions": [action]}
+            # Honest labeling (usage-audit finding): the default local
+            # model is MockLocalModel, a canned test double, not a real
+            # planner. Flag every plan it produces so no caller mistakes
+            # mock output for real planning.
+            if getattr(getattr(STATE.local_runtime, "model", None),
+                       "is_test_double", False):
+                plan["mock"] = True
+                plan["mock_warning"] = (
+                    "TEST DOUBLE: this plan was produced by MockLocalModel "
+                    "(canned responses, ignores page state). Set "
+                    "SYNK_LOCAL_MODEL=endpoint for a real local SLM.")
             plan["routing"] = routing_type
             plan["tier"] = "local-slm"
             plan["tier_reason"] = f"routed via {routing_type}"
@@ -933,6 +982,7 @@ class Handler(BaseHTTPRequestHandler):
         # Compatibility keys: the first action's verification + claim id,
         # and the legacy per-action "results" list (execution outcomes).
         verifications = out["verifications"]
+        first_verification = self._first_verification(verifications)
         results = [{"ok": e["state"] not in ("FAILED", "CONFLICTING", "CANCELLED"),
                     "tool": e["tool"], "state": e["state"],
                     "error_code": e["error_code"], "error": e["error"]}
@@ -943,10 +993,9 @@ class Handler(BaseHTTPRequestHandler):
                                 "transaction_status": out["transaction_status"],
                                 "action_results": out["action_results"],
                                 "verifications": verifications,
-                                "claim_id": (verifications[0]["claim_id"]
-                                             if verifications else None),
-                                "verification": verifications[0]
-                                if verifications else None,
+                                "claim_id": (first_verification["claim_id"]
+                                             if first_verification else None),
+                                "verification": first_verification,
                                 "latency_ms": out["latency_ms"],
                                 "paused_for_user": STATE.tools.paused_for_user})
 
@@ -972,6 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
             "note": b.get("note", "tx"),
         })
         verifications = out["verifications"]
+        first_verification = self._first_verification(verifications)
         results = [{"ok": e["state"] not in ("FAILED", "CONFLICTING", "CANCELLED"),
                     "tool": e["tool"], "state": e["state"],
                     "verdict": ("executed" if e["state"] == "VERIFIED"
@@ -986,10 +1036,9 @@ class Handler(BaseHTTPRequestHandler):
                                 "transaction_status": out["transaction_status"],
                                 "action_results": out["action_results"],
                                 "verifications": verifications,
-                                "claim_id": (verifications[0]["claim_id"]
-                                             if verifications else None),
-                                "verification": verifications[0]
-                                if verifications else None,
+                                "claim_id": (first_verification["claim_id"]
+                                             if first_verification else None),
+                                "verification": first_verification,
                                 "latency_ms": out["latency_ms"],
                                 "ownership": STATE.ownership.snapshot()})
 
@@ -1278,7 +1327,7 @@ class Handler(BaseHTTPRequestHandler):
                 "transaction_status": out["transaction_status"],
                 "action_results": out["action_results"],
                 "verifications": verifications,
-                "verification": verifications[0] if verifications else None,
+                "verification": self._first_verification(verifications),
                 "latency_ms": out["latency_ms"]}
         if selection is not None:
             resp["selection"] = selection.to_dict()

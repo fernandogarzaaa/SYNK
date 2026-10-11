@@ -62,7 +62,9 @@ Every subsystem carries one honest label:
 | Contamination guards (`harness/contamination.py`) | REAL | Injection quarantine with unicode-obfuscation hardening (NFKC folding, invisible-char detection, Cyrillic/Greek confusable map), secret redaction, schema validation |
 | Task scheduler (`harness/task_scheduler.py`) | REAL | Sequential, lease-aware, dependency-ordered; dispatch correctness benchmarked |
 | Workflow learning | REAL | Miner + memory, replay/suggest endpoints |
-| Model router / compiler | REAL | Requirement-based routing, task-spec compiler with typed errors |
+| Model router (`harness/model_router.py`) | REAL | Requirement-based routing over a model registry |
+| Task-spec compiler (`harness/compiler.py`) | REAL | Validates task specs with typed CompileErrors before planning |
+| Local SLM decision head (`harness/local/model.py`) | TEST DOUBLE | Default `MockLocalModel` returns canned decisions and ignores page state; `/plan` flags its output with `"mock": true`. Set `SYNK_LOCAL_MODEL=endpoint` for a real local SLM |
 | Closed-loop agent (`/agent/*`) | REAL | Observe > plan > validate > lease > execute > observe > verify > decide |
 | Extension (attached mode) | REAL | Content script robust primitives and honest acks; unpacked-extension snapshot push and live `value.changed` event reporting verified in a real browser (`tests/live/`) |
 | Owned-browser adapter (Playwright/CDP) | REAL | Honest mode separation (owned launch, attached extension, explicit CDP endpoint); live launch, typing, navigation, snapshots verified in a real browser (`tests/live/`) |

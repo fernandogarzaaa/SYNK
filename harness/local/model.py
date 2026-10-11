@@ -35,10 +35,17 @@ class LocalModel:
         raise NotImplementedError("Subclasses must implement infer()")
 
 class MockLocalModel(LocalModel):
+    """TEST DOUBLE: deterministic stand-in for a real on-device SLM.
+
+    Returns the same canned decision for every input; it does NOT look at
+    page state, and its output must never be mistaken for real planning.
+    It is the default only so /plan works offline without a model server.
+    Set SYNK_LOCAL_MODEL=endpoint for a real local SLM
+    (EndpointLocalModel).
     """
-    Deterministic mock SLM for Beta.2 development.
-    Simulates confidence-based routing and decision patterns.
-    """
+    # Machine-readable marker so callers (e.g. the /plan endpoint) can
+    # honestly label responses produced through this test double.
+    is_test_double = True
     def infer(self, request: InferenceRequest) -> InferenceResult:
         # Mock behavior: if 'escalate' in prompt, simulate low confidence
         # Otherwise simulate a high-confidence structured decision
