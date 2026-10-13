@@ -223,6 +223,12 @@ the user's own browser data).
 
 Summary; the full model is in `SECURITY.md`.
 
+- **Loopback only, no cross-site access:** the harness binds 127.0.0.1
+  and has no auth, so it refuses requests whose `Host` is not
+  localhost/127.0.0.1/[::1] (DNS rebinding) and requests from web
+  origins, except the content-script pushes `/snapshot` and `/event`.
+  Extension (`chrome-extension://`), Tauri and loopback origins are
+  allowed; add others with `SYNK_TRUSTED_ORIGINS` (comma-separated).
 - **Default-deny policy:** every page origin must be registered with an
   explicit allowlist before any action runs there. Unknown origins fail
   closed. Privilege escalation (read -> mutate) triggers a fresh,

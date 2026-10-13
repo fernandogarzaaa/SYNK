@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-10-13
+
+### Security
+- Any web page open in the user's browser could control the harness. It is
+  unauthenticated on 127.0.0.1:18080 and answered every request with
+  `Access-Control-Allow-Origin: *`. A "simple" `text/plain` POST needs no
+  CORS preflight, so a page could register itself in the default-deny origin
+  policy (`/policy/origin`), drive `/act` / `/transact` / `/agent/*`, or read
+  `/memory`, `/audit` and `/world`. A DNS-rebinding page could read them too.
+  The harness now returns 403 for a non-loopback `Host`, and for web origins
+  on every path except the content-script pushes (`POST /snapshot`, `/event`).
+  CORS is reflected only to extension, Tauri and loopback origins (plus
+  `SYNK_TRUSTED_ORIGINS`). Requests without an `Origin` (curl, the Tauri
+  shell's Rust client) are unchanged.
+
 ## [2.1.0] - 2026-10-13
 
 ### Fixed
