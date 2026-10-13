@@ -328,6 +328,49 @@ STATE = State(":memory:")
 STATE._human_steps = []
 
 
+# -- Cross-origin / DNS-rebinding guard ----------------------------------------
+# Content scripts push from the page's own (arbitrary) origin, so only these
+# two endpoints accept web origins. Everything else needs no Origin (curl,
+# the Tauri shell's Rust client, tests), an extension/Tauri origin, a loopback
+# origin, or one listed in SYNK_TRUSTED_ORIGINS (comma-separated).
+PAGE_PUSH_PATHS = frozenset({"/snapshot", "/event"})
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_TRUSTED_SCHEMES = ("chrome-extension://", "moz-extension://",
+                    "safari-web-extension://", "tauri://")
+
+
+def _hostname(netloc: str) -> str:
+    netloc = (netloc or "").strip().lower()
+    if netloc.startswith("["):
+        return netloc[1:netloc.find("]")] if "]" in netloc else netloc
+    return netloc.rsplit(":", 1)[0] if netloc.count(":") == 1 else netloc
+
+
+def origin_is_trusted(origin: str) -> bool:
+    o = (origin or "").strip()
+    if o.lower().startswith(_TRUSTED_SCHEMES):
+        return True
+    extra = {x.strip() for x in os.environ.get("SYNK_TRUSTED_ORIGINS", "").split(",") if x.strip()}
+    if o in extra:
+        return True
+    u = urlparse(o)
+    h = _hostname(u.netloc)
+    # *.localhost (e.g. Tauri's http://tauri.localhost on Windows) always
+    # resolves to loopback, so no remote site can hold that origin.
+    return u.scheme in ("http", "https") and (h in _LOOPBACK_HOSTS or h.endswith(".localhost"))
+
+
+def check_request(host, origin, path, method):
+    """(allowed, reason) for one request; pure so it can be unit-tested."""
+    if host is not None and _hostname(host) not in _LOOPBACK_HOSTS:
+        return False, "host_not_allowed"
+    if origin is None or origin_is_trusted(origin):
+        return True, ""
+    if path in PAGE_PUSH_PATHS and method in ("POST", "OPTIONS"):
+        return True, ""
+    return False, "cross_origin_forbidden"
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CoworkHarness/0.2"
 
@@ -340,16 +383,44 @@ class Handler(BaseHTTPRequestHandler):
         # arbitrary web origins to this loopback harness. Without CORS
         # headers the browser blocks the push (found by live-browser
         # verification; the fake backend never performs a real fetch).
-        # The harness binds 127.0.0.1 and is unauthenticated by design;
-        # these headers match that local-operator threat model.
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # The harness binds 127.0.0.1 and is unauthenticated, so only the
+        # content-script push endpoints are open to web origins (see
+        # _request_allowed); everything else is reflected only to trusted
+        # local/extension origins.
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
+    def _cors_headers(self) -> None:
+        path = urlparse(self.path).path
+        origin = self.headers.get("Origin")
+        if path in PAGE_PUSH_PATHS:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif origin and origin_is_trusted(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
+    def _request_allowed(self, method: str) -> bool:
+        """Reject cross-site and DNS-rebinding requests (403).
+
+        Any web page open in the user's browser can reach 127.0.0.1:18080:
+        a "simple" text/plain POST needs no CORS preflight, so without this
+        guard a page could register itself in the default-deny origin
+        policy, drive /act or /transact, or read /memory and /audit.
+        """
+        ok, reason = check_request(self.headers.get("Host"),
+                                   self.headers.get("Origin"),
+                                   urlparse(self.path).path, method)
+        if not ok:
+            self._send(403, {"ok": False, "error": reason})
+        return ok
+
     def do_OPTIONS(self) -> None:
         # CORS preflight for the extension's cross-origin JSON pushes.
+        if not self._request_allowed("OPTIONS"):
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._cors_headers()
         self.send_header("Access-Control-Allow-Methods",
                          "POST, GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
@@ -405,6 +476,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- GET --------------------------------------------------------------------
     def do_GET(self):
+        if not self._request_allowed("GET"):
+            return
         return self._fail_loud(self._do_GET)
 
     def _do_GET(self):
@@ -456,6 +529,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- POST -------------------------------------------------------------------
     def do_POST(self):
+        if not self._request_allowed("POST"):
+            return
         return self._fail_loud(self._do_POST)
 
     def _do_POST(self):
