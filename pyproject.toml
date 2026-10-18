@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synk-harness"
+version = "2.1.1"
+description = "Transactional shared-state runtime for human-agent web interaction (Python harness)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Fernando Garza" },
+]
+keywords = ["browser-automation", "agents", "shared-state", "verification"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "playwright>=1.63.0,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+dev = ["pytest", "cyclonedx-bom"]
+
+[project.scripts]
+synk-server = "harness.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["harness*"]
+namespaces = true

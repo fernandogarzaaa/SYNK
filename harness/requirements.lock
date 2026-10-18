@@ -1,0 +1,6 @@
+# Frozen dependency lock for the SYNK Python harness.
+# Pinned from a clean resolve of harness/requirements.txt on 2026-10-19.
+# Regenerate: pip install -r harness/requirements.txt && pip freeze | grep -iE '^(playwright|pyee|greenlet)=='
+greenlet==3.5.6
+playwright==1.63.0
+pyee==13.0.1
